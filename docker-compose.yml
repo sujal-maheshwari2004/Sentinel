@@ -1,0 +1,42 @@
+# =============================================================================
+# Sentinel - Full Stack
+# Usage: docker compose up
+# =============================================================================
+#
+# Prometheus config - add this block to your prometheus.yml:
+#   remote_write:
+#     - url: http://sentinel:9000/ingest
+#
+# Grafana config - add this scrape target:
+#   scrape_configs:
+#     - job_name: sentinel
+#       static_configs:
+#         - targets: ['sentinel:9001']
+#
+# =============================================================================
+
+services:
+
+  sentinel:
+    build: .
+    ports:
+      - "9000:9000"   # POST /ingest  - Prometheus remote_write target
+      - "9001:9001"   # GET  /metrics - Grafana scrape target
+    volumes:
+      - ./snapshots:/app/snapshots
+      - ./artifacts:/app/artifacts
+      - ./sentinel.yaml:/app/sentinel.yaml
+    env_file:
+      - .env
+    depends_on:
+      - mlflow
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+    command: mlflow server --host 0.0.0.0 --backend-store-uri /mlruns
+    restart: unless-stopped
