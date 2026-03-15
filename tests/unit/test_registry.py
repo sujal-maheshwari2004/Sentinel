@@ -1,76 +1,79 @@
-{
-  "title": "Sentinel — CPU Exhaustion",
-  "uid": "sentinel-cpu-exhaustion",
-  "schemaVersion": 38,
-  "time": { "from": "now-3h", "to": "now" },
-  "refresh": "30s",
-  "panels": [
-    {
-      "id": 1,
-      "type": "gauge",
-      "title": "CPU Exhaustion Risk (10m horizon)",
-      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 6 },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "thresholds": {
-          "steps": [
-            { "color": "green", "value": 0 },
-            { "color": "yellow", "value": 0.4 },
-            { "color": "red", "value": 0.7 }
-          ]
-        }
-      },
-      "targets": [
-        {
-          "expr": "predictivex_failure_probability{model=\"cpu-exhaustion\"}",
-          "legendFormat": "{{service}}"
-        }
-      ]
-    },
-    {
-      "id": 2,
-      "type": "timeseries",
-      "title": "CPU Exhaustion Risk Over Time",
-      "gridPos": { "x": 6, "y": 0, "w": 18, "h": 6 },
-      "targets": [
-        {
-          "expr": "predictivex_failure_probability{model=\"cpu-exhaustion\"}",
-          "legendFormat": "{{service}}"
-        }
-      ]
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Model State",
-      "gridPos": { "x": 0, "y": 6, "w": 4, "h": 4 },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "mappings": [
-          { "type": "value", "options": { "0": { "text": "WAITING" }, "1": { "text": "TRAINING" }, "2": { "text": "INFERENCING" }, "3": { "text": "RETRAINING" }, "4": { "text": "ERROR" } } }
-        ]
-      },
-      "targets": [
-        { "expr": "predictivex_model_state{model=\"cpu-exhaustion\"}", "legendFormat": "state" }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "bargauge",
-      "title": "Warmup Progress",
-      "gridPos": { "x": 4, "y": 6, "w": 8, "h": 4 },
-      "targets": [
-        { "expr": "predictivex_model_warmup_progress{model=\"cpu-exhaustion\"}", "legendFormat": "progress" }
-      ]
-    },
-    {
-      "id": 5,
-      "type": "stat",
-      "title": "Consecutive Errors",
-      "gridPos": { "x": 12, "y": 6, "w": 4, "h": 4 },
-      "targets": [
-        { "expr": "predictivex_model_consecutive_errors{model=\"cpu-exhaustion\"}", "legendFormat": "errors" }
-      ]
-    }
-  ]
-}
+import pytest
+
+from core.config import InferenceConfig, ModelConfig, RetrainConfig, WaitConfig
+from core.registry import ModelInstance, ModelRegistry, ModelState
+
+
+def make_config(name: str = "test-model") -> ModelConfig:
+    return ModelConfig(
+        name=name,
+        path="",
+        wait=WaitConfig(strategy="both", time_hours=6, rows=1000),
+        retrain=RetrainConfig(schedule="0 2 * * *", min_rows=1000),
+        inference=InferenceConfig(interval_seconds=60, timeout_seconds=30, fallback="continue_old"),
+    )
+
+
+def test_register_model_starts_in_waiting():
+    registry = ModelRegistry()
+    instance = registry.register(make_config("my-model"))
+    assert instance.state == ModelState.WAITING
+    assert instance.config.name == "my-model"
+
+
+def test_get_returns_registered_model():
+    registry = ModelRegistry()
+    registry.register(make_config("my-model"))
+    instance = registry.get("my-model")
+    assert instance is not None
+    assert instance.config.name == "my-model"
+
+
+def test_get_unknown_model_returns_none():
+    registry = ModelRegistry()
+    assert registry.get("nonexistent") is None
+
+
+def test_get_all_returns_all_models():
+    registry = ModelRegistry()
+    registry.register(make_config("model-a"))
+    registry.register(make_config("model-b"))
+    all_models = registry.get_all()
+    names = {m.config.name for m in all_models}
+    assert names == {"model-a", "model-b"}
+
+
+def test_get_by_state_filters_correctly():
+    registry = ModelRegistry()
+    m1 = registry.register(make_config("model-a"))
+    m2 = registry.register(make_config("model-b"))
+    m2.state = ModelState.INFERENCING
+
+    waiting = registry.get_by_state(ModelState.WAITING)
+    inferencing = registry.get_by_state(ModelState.INFERENCING)
+
+    assert len(waiting) == 1
+    assert waiting[0].config.name == "model-a"
+    assert len(inferencing) == 1
+    assert inferencing[0].config.name == "model-b"
+
+
+def test_transition_changes_state():
+    registry = ModelRegistry()
+    model = registry.register(make_config())
+    assert model.state == ModelState.WAITING
+
+    registry.transition(model, ModelState.TRAINING)
+    assert model.state == ModelState.TRAINING
+
+    registry.transition(model, ModelState.INFERENCING)
+    assert model.state == ModelState.INFERENCING
+
+
+def test_register_multiple_models_independently():
+    registry = ModelRegistry()
+    m1 = registry.register(make_config("a"))
+    m2 = registry.register(make_config("b"))
+
+    registry.transition(m1, ModelState.ERROR)
+    assert m2.state == ModelState.WAITING
