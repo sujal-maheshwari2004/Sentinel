@@ -1,0 +1,27 @@
+name: memory-saturation
+version: 1.0.0
+description: "Predicts memory exhaustion / OOM risk 15 minutes ahead using trend analysis"
+
+requires:
+  metrics:
+    - container_memory_usage_bytes
+  min_history: 4h
+
+wait:
+  strategy: both
+  time_hours: 12
+  rows: 20000
+
+retrain:
+  schedule: "0 3 * * *"
+  min_rows: 20000
+
+inference:
+  interval_seconds: 60
+  timeout_seconds: 30
+  fallback: continue_old
+
+outputs:
+  - name: failure_probability
+    type: probability
+    horizon_seconds: 900

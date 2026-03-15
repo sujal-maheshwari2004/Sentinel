@@ -1,0 +1,27 @@
+name: cpu-exhaustion
+version: 1.0.0
+description: "Predicts CPU throttling onset 10 minutes ahead using sliding window features"
+
+requires:
+  metrics:
+    - process_cpu_seconds_total
+  min_history: 2h
+
+wait:
+  strategy: both
+  time_hours: 6
+  rows: 10000
+
+retrain:
+  schedule: "0 4 * * *"
+  min_rows: 10000
+
+inference:
+  interval_seconds: 60
+  timeout_seconds: 30
+  fallback: continue_old
+
+outputs:
+  - name: failure_probability
+    type: probability
+    horizon_seconds: 600

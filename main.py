@@ -41,6 +41,7 @@ def main() -> None:
     server.buffer = buffer
     server.registry = registry
     server.metrics_store = metrics_store
+    server.config = config
 
     # Start background scheduler (snapshot flush, inference, retrain)
     scheduler = start_scheduler(config, registry, buffer, metrics_store)

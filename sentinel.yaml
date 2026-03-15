@@ -1,0 +1,41 @@
+sentinel:
+  ingest_port: 9000
+  metrics_port: 9001
+  log_level: info
+
+identity:
+  service_name: my-service
+  namespace: default
+  cluster: local
+  team: ""
+  extra_labels: {}
+
+snapshot:
+  dir: ./snapshots
+  retention_days: 30
+  interval_hours: 6
+
+artifacts:
+  dir: ./artifacts
+
+exposition:
+  max_series_total: 10000
+  cardinality_warning_threshold: 5000
+  drop_high_cardinality_labels:
+    - instance
+    - pod
+
+drift:
+  enabled: true
+  method: psi
+  warning_threshold: 0.2
+  retrain_threshold: 0.4
+
+mlflow:
+  tracking_uri: http://mlflow:5000
+
+dvc:
+  remote: local
+  remote_path: ./dvc-storage
+
+models: []
