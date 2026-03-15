@@ -1,13 +1,15 @@
 # =============================================================================
 # Sentinel - Full Stack
-# Usage: docker compose up
+# Usage: docker compose up -d
 # =============================================================================
 #
-# Prometheus config - add this block to your prometheus.yml:
+# After starting, add these to your existing stack:
+#
+# prometheus.yml — add one block:
 #   remote_write:
 #     - url: http://sentinel:9000/ingest
 #
-# Grafana config - add this scrape target:
+# Grafana — add one scrape target:
 #   scrape_configs:
 #     - job_name: sentinel
 #       static_configs:
@@ -20,8 +22,8 @@ services:
   sentinel:
     build: .
     ports:
-      - "9000:9000"   # POST /ingest  - Prometheus remote_write target
-      - "9001:9001"   # GET  /metrics - Grafana scrape target
+      - "9000:9000"   # POST /ingest  — Prometheus remote_write target
+      - "9001:9001"   # GET  /metrics — Grafana scrape target
     volumes:
       - ./snapshots:/app/snapshots
       - ./artifacts:/app/artifacts
@@ -29,8 +31,15 @@ services:
     env_file:
       - .env
     depends_on:
-      - mlflow
+      mlflow:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
@@ -40,3 +49,9 @@ services:
       - ./mlruns:/mlruns
     command: mlflow server --host 0.0.0.0 --backend-store-uri /mlruns
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
