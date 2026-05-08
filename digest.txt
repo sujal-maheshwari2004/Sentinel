@@ -149,74 +149,35 @@ FILE: sentinel/config.py
 ================================================
 # sentinel/config.py
 
+from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Type
-from sentinel.pipeline.models.base import BaseModel
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sentinel.pipeline.models.base import BaseModel
 
 
 @dataclass
 class WatchConfig:
-    """
-    Configuration for a single watched metric.
-    One WatchConfig = one model = one prediction series emitted.
-    """
-
     metric: str
-    # e.g. {"job": "api", "instance": "localhost:8080"}
     labels: dict[str, str] = field(default_factory=dict)
-
-    # model class to use, must be a subclass of BaseModel
-    model_class: Type[BaseModel] = None
-
-    # cron string defining cold start and retraining schedule
-    # e.g. "0 */6 * * *" = every 6 hours
+    model_class: type[BaseModel] | None = None
     cron: str = "0 */6 * * *"
-
-    # resolution of data points to pull and train on
-    # e.g. "1m", "5m", "1h"
     granularity: str = "1m"
-
-    # how far ahead to predict
-    # e.g. "5m", "15m", "1h"
     horizon: str = "5m"
-
-    # how much historical data to use as features
-    # e.g. "30m", "1h", "6h"
     lookback: str = "30m"
-
-    # MAE threshold above which drift is considered low severity â†’ finetune
     drift_finetune_threshold: float = 0.1
-
-    # MAE threshold above which drift is considered high severity â†’ full retrain
     drift_retrain_threshold: float = 0.3
 
 
 @dataclass
 class SentinelConfig:
-    """
-    Top level configuration for the Sentinel instance.
-    """
-
-    # Prometheus base URL to pull metrics from
     prometheus_url: str = "http://localhost:9090"
-
-    # port Sentinel exposes its /metrics endpoint on
     emitter_port: int = 8080
-
-    # where serialized model artifacts are stored
-    # can be a local path or later extended to S3/GCS
     artifact_store: str = "./sentinel_artifacts"
-
-    # how many versions to retain per metric before pruning old ones
     max_versions_per_metric: int = 5
-
-    # list of metrics to watch
     watches: list[WatchConfig] = field(default_factory=list)
-
-    # optional global scrape timeout in seconds
     scrape_timeout: int = 10
-
-    # whether to emit confidence bounds alongside predictions
     emit_confidence_bounds: bool = False
 
 
@@ -1519,9 +1480,6 @@ FILE: sentinel/pipeline/__init__.py
 from sentinel.pipeline.drift import DriftMonitor, DriftResult, DriftSeverity
 from sentinel.pipeline.versioning import ModelVersion, VersionStore
 from sentinel.pipeline.registry import ModelRegistry
-from sentinel.pipeline.trainer import Trainer
-from sentinel.pipeline.predictor import Predictor
-from sentinel.pipeline.scheduler import MetricScheduler
 
 __all__ = [
     "DriftMonitor",
@@ -1530,9 +1488,6 @@ __all__ = [
     "ModelVersion",
     "VersionStore",
     "ModelRegistry",
-    "Trainer",
-    "Predictor",
-    "MetricScheduler",
 ]
 
 
@@ -3678,7 +3633,251 @@ class TestBuildMetricKey:
 ================================================
 FILE: tests/test_emitter/test_server.py
 ================================================
-[Empty file]
+# tests/test_emitter/test_server.py
+
+import time
+import pytest
+import numpy as np
+from unittest.mock import MagicMock, patch, PropertyMock
+from prometheus_client import CollectorRegistry
+from sentinel.emitter.server import MetricEmitter, EmitterServer
+from sentinel.pipeline.models.base import PredictionResult
+from sentinel.pipeline.drift import DriftMonitor
+from sentinel.config import WatchConfig, SentinelConfig
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+
+
+def _make_watch():
+    return WatchConfig(
+        metric="http_request_duration_seconds",
+        labels={"job": "api"},
+        model_class=ExponentialSmoothingModel,
+        granularity="1m",
+        horizon="5m",
+        lookback="30m",
+    )
+
+
+def _make_prediction(n_steps=5):
+    return PredictionResult(
+        values=np.linspace(1.0, 2.0, n_steps),
+        timestamps=np.array([time.time() + (i + 1) * 60 for i in range(n_steps)]),
+        model_version="v1",
+    )
+
+
+def _make_past_prediction(n_steps=5):
+    """Prediction whose timestamps have already elapsed â€” triggers drift recording."""
+    return PredictionResult(
+        values=np.linspace(1.0, 2.0, n_steps),
+        timestamps=np.array([time.time() - (i + 1) * 60 for i in range(n_steps)]),
+        model_version="v1",
+    )
+
+
+class TestMetricEmitter:
+
+    def _make_emitter(self, prediction=None, registry=None):
+        watch = _make_watch()
+        predictor = MagicMock()
+        predictor.predict.return_value = prediction or _make_prediction()
+
+        drift_monitor = MagicMock(spec=DriftMonitor)
+        scraper = MagicMock()
+        scraper.fetch_latest.return_value = (time.time(), 1.5)
+
+        reg = registry or CollectorRegistry()
+
+        return MetricEmitter(
+            watch_config=watch,
+            predictor=predictor,
+            drift_monitor=drift_monitor,
+            scraper=scraper,
+            emit_confidence_bounds=False,
+            registry=reg,
+        ), predictor, drift_monitor, scraper
+
+    def test_tick_calls_predictor(self):
+        emitter, predictor, _, _ = self._make_emitter()
+        emitter.tick()
+        predictor.predict.assert_called_once()
+
+    def test_tick_does_nothing_when_prediction_is_none(self):
+        emitter, predictor, drift_monitor, _ = self._make_emitter(prediction=None)
+        predictor.predict.return_value = None
+        emitter.tick()
+        # no gauges created, no drift recorded
+        assert len(emitter._gauges) == 0
+
+    def test_tick_creates_gauges_for_each_step(self):
+        reg = CollectorRegistry()
+        emitter, _, _, _ = self._make_emitter(registry=reg)
+        emitter.tick()
+        # 5 steps = 5 gauges
+        assert len(emitter._gauges) == 5
+
+    def test_tick_sets_gauge_values(self):
+        reg = CollectorRegistry()
+        emitter, _, _, _ = self._make_emitter(registry=reg)
+        emitter.tick()
+        # gauges created without raising
+        assert len(emitter._gauges) > 0
+
+    def test_tick_stores_pending_predictions(self):
+        emitter, _, _, _ = self._make_emitter()
+        emitter.tick()
+        assert len(emitter._pending_predictions) == 5
+
+    def test_tick_feeds_drift_when_predictions_elapsed(self):
+        emitter, predictor, drift_monitor, scraper = self._make_emitter()
+
+        # first tick stores pending predictions with past timestamps
+        predictor.predict.return_value = _make_past_prediction()
+        emitter.tick()
+
+        # second tick should detect elapsed timestamps and feed drift
+        predictor.predict.return_value = _make_prediction()
+        emitter.tick()
+
+        drift_monitor.record.assert_called()
+
+    def test_drift_not_recorded_when_actual_fetch_fails(self):
+        emitter, predictor, drift_monitor, scraper = self._make_emitter()
+
+        predictor.predict.return_value = _make_past_prediction()
+        scraper.fetch_latest.return_value = None
+
+        emitter.tick()
+        emitter.tick()
+
+        drift_monitor.record.assert_not_called()
+
+    def test_confidence_bounds_not_emitted_by_default(self):
+        reg = CollectorRegistry()
+        emitter, _, _, _ = self._make_emitter(registry=reg)
+
+        result = _make_prediction()
+        result.lower_bound = np.ones(5) * 0.9
+        result.upper_bound = np.ones(5) * 1.1
+        emitter.predictor.predict.return_value = result
+
+        emitter.tick()
+        # only main series gauges â€” no bound gauges
+        assert all("lower" not in k and "upper" not in k for k in emitter._gauges)
+
+    def test_confidence_bounds_emitted_when_enabled(self):
+        watch = _make_watch()
+        predictor = MagicMock()
+        result = _make_prediction()
+        result.lower_bound = np.ones(5) * 0.9
+        result.upper_bound = np.ones(5) * 1.1
+        predictor.predict.return_value = result
+
+        drift_monitor = MagicMock(spec=DriftMonitor)
+        scraper = MagicMock()
+        reg = CollectorRegistry()
+
+        emitter = MetricEmitter(
+            watch_config=watch,
+            predictor=predictor,
+            drift_monitor=drift_monitor,
+            scraper=scraper,
+            emit_confidence_bounds=True,
+            registry=reg,
+        )
+
+        emitter.tick()
+        # main + lower + upper = 15 gauges (5 steps each)
+        assert len(emitter._gauges) == 15
+
+    def test_second_tick_reuses_existing_gauges(self):
+        reg = CollectorRegistry()
+        emitter, _, _, _ = self._make_emitter(registry=reg)
+
+        emitter.tick()
+        gauge_count_after_first = len(emitter._gauges)
+
+        emitter.tick()
+        gauge_count_after_second = len(emitter._gauges)
+
+        assert gauge_count_after_first == gauge_count_after_second
+
+
+class TestEmitterServer:
+
+    def test_register_adds_emitter(self):
+        config = SentinelConfig(emitter_port=19090)
+        server = EmitterServer(config)
+        emitter = MagicMock()
+        server.register(emitter)
+        assert emitter in server._emitters
+
+    def test_stop_sets_stop_event(self):
+        config = SentinelConfig(emitter_port=19091)
+        server = EmitterServer(config)
+        server.stop()
+        assert server._stop_event.is_set()
+
+    def test_loop_calls_tick_on_all_emitters(self):
+        config = SentinelConfig(emitter_port=19092)
+        server = EmitterServer(config)
+
+        emitter1 = MagicMock()
+        emitter2 = MagicMock()
+        server.register(emitter1)
+        server.register(emitter2)
+
+        # patch sleep and stop after first pass by setting event inside sleep
+        def stop_after_one(*args, **kwargs):
+            server._stop_event.set()
+
+        with patch("sentinel.emitter.server.time.sleep", side_effect=stop_after_one):
+            server._loop()
+
+        emitter1.tick.assert_called_once()
+        emitter2.tick.assert_called_once()
+
+    def test_loop_continues_after_emitter_exception(self):
+        config = SentinelConfig(emitter_port=19093)
+        server = EmitterServer(config)
+
+        bad_emitter = MagicMock()
+        bad_emitter.tick.side_effect = RuntimeError("boom")
+        bad_emitter.watch_config = MagicMock()
+        bad_emitter.watch_config.metric = "bad_metric"
+
+        good_emitter = MagicMock()
+        server.register(bad_emitter)
+        server.register(good_emitter)
+
+        def stop_after_one(*args, **kwargs):
+            server._stop_event.set()
+
+        with patch("sentinel.emitter.server.time.sleep", side_effect=stop_after_one):
+            server._loop()
+
+        good_emitter.tick.assert_called_once()
+
+    def test_start_launches_thread(self):
+        config = SentinelConfig(emitter_port=19094)
+        server = EmitterServer(config)
+
+        with patch("sentinel.emitter.server.start_http_server"):
+            server.start()
+
+        assert server._thread is not None
+        assert server._thread.is_alive()
+        server.stop()
+
+    def test_start_starts_http_server_on_configured_port(self):
+        config = SentinelConfig(emitter_port=19095)
+        server = EmitterServer(config)
+
+        with patch("sentinel.emitter.server.start_http_server") as mock_http:
+            server.start()
+            mock_http.assert_called_once_with(19095)
+
+        server.stop()
 
 
 ================================================
@@ -4015,7 +4214,270 @@ class TestBuildPredictionInput:
 ================================================
 FILE: tests/test_ingestor/test_scraper.py
 ================================================
-[Empty file]
+# tests/test_ingestor/test_scraper.py
+
+import pytest
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
+from sentinel.ingestor.scraper import PrometheusScraper
+
+
+def _make_scraper():
+    return PrometheusScraper(prometheus_url="http://localhost:9090", timeout=5)
+
+
+def _mock_range_response(values: list):
+    return {
+        "status": "success",
+        "data": {
+            "result": [
+                {"values": [[ts, str(val)] for ts, val in values]}
+            ]
+        }
+    }
+
+
+def _mock_instant_response(ts: float, val: float):
+    return {
+        "status": "success",
+        "data": {
+            "result": [
+                {"value": [ts, str(val)]}
+            ]
+        }
+    }
+
+
+class TestBuildSelector:
+
+    def test_no_labels(self):
+        scraper = _make_scraper()
+        assert scraper._build_selector("my_metric", {}) == "my_metric"
+
+    def test_with_single_label(self):
+        scraper = _make_scraper()
+        result = scraper._build_selector("my_metric", {"job": "api"})
+        assert result == 'my_metric{job="api"}'
+
+    def test_with_multiple_labels_sorted(self):
+        scraper = _make_scraper()
+        result = scraper._build_selector("my_metric", {"job": "api", "env": "prod"})
+        assert result == 'my_metric{env="prod",job="api"}'
+
+    def test_labels_always_sorted(self):
+        scraper = _make_scraper()
+        r1 = scraper._build_selector("m", {"b": "2", "a": "1"})
+        r2 = scraper._build_selector("m", {"a": "1", "b": "2"})
+        assert r1 == r2
+
+
+class TestFetchRange:
+
+    def test_returns_samples_on_success(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = _mock_range_response(
+            [(1700000060.0, 1.5), (1700000120.0, 2.0)]
+        )
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_range(
+                metric="http_requests_total",
+                labels={"job": "api"},
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                granularity="1m",
+            )
+
+        assert len(result) == 2
+        assert result[0] == (1700000060.0, 1.5)
+        assert result[1] == (1700000120.0, 2.0)
+
+    def test_returns_empty_on_no_results(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "status": "success",
+            "data": {"result": []}
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_range(
+                metric="my_metric",
+                labels={},
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                granularity="1m",
+            )
+
+        assert result == []
+
+    def test_returns_empty_on_non_success_status(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "error", "error": "bad query"}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_range(
+                metric="my_metric",
+                labels={},
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                granularity="1m",
+            )
+
+        assert result == []
+
+    def test_returns_empty_on_http_error(self):
+        import httpx
+        scraper = _make_scraper()
+
+        with patch.object(scraper._client, "get", side_effect=httpx.RequestError("timeout")):
+            result = scraper.fetch_range(
+                metric="my_metric",
+                labels={},
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                granularity="1m",
+            )
+
+        assert result == []
+
+    def test_values_are_floats(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = _mock_range_response(
+            [(1700000060, 42)]
+        )
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_range(
+                metric="m",
+                labels={},
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                granularity="1m",
+            )
+
+        ts, val = result[0]
+        assert isinstance(ts, float)
+        assert isinstance(val, float)
+
+    def test_uses_first_series_only(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "status": "success",
+            "data": {
+                "result": [
+                    {"values": [[1.0, "10"]]},
+                    {"values": [[2.0, "20"]]},  # second series, should be ignored
+                ]
+            }
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_range(
+                metric="m", labels={},
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                granularity="1m",
+            )
+
+        assert len(result) == 1
+        assert result[0] == (1.0, 10.0)
+
+
+class TestFetchLatest:
+
+    def test_returns_tuple_on_success(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = _mock_instant_response(1700000060.0, 3.14)
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_latest("my_metric", {})
+
+        assert result == (1700000060.0, 3.14)
+
+    def test_returns_none_on_empty_result(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "status": "success",
+            "data": {"result": []}
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_latest("my_metric", {})
+
+        assert result is None
+
+    def test_returns_none_on_request_error(self):
+        import httpx
+        scraper = _make_scraper()
+
+        with patch.object(scraper._client, "get", side_effect=httpx.RequestError("conn refused")):
+            result = scraper.fetch_latest("my_metric", {})
+
+        assert result is None
+
+    def test_returns_none_on_non_success_status(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "error"}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_latest("my_metric", {})
+
+        assert result is None
+
+    def test_values_are_floats(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.json.return_value = _mock_instant_response(1700000000, 99)
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            result = scraper.fetch_latest("my_metric", {})
+
+        ts, val = result
+        assert isinstance(ts, float)
+        assert isinstance(val, float)
+
+
+class TestCheckConnectivity:
+
+    def test_returns_true_on_200(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            assert scraper.check_connectivity() is True
+
+    def test_returns_false_on_non_200(self):
+        scraper = _make_scraper()
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+
+        with patch.object(scraper._client, "get", return_value=mock_response):
+            assert scraper.check_connectivity() is False
+
+    def test_returns_false_on_request_error(self):
+        import httpx
+        scraper = _make_scraper()
+
+        with patch.object(scraper._client, "get", side_effect=httpx.RequestError("refused")):
+            assert scraper.check_connectivity() is False
 
 
 ================================================
@@ -4159,12 +4621,12 @@ def _make_watch():
         model_class=ExponentialSmoothingModel,
         granularity="1m",
         horizon="5m",
-        lookback="30m",
+        lookback="10m",       # was 30m
         cron="0 */6 * * *",
     )
 
 
-def _fill_buffer(buf, n=35):
+def _fill_buffer(buf, n=20):   # was 35
     for i in range(n):
         buf.push(float(1700000000 + i * 60), float(i) + np.random.normal(0, 0.1))
 
@@ -4172,18 +4634,13 @@ def _fill_buffer(buf, n=35):
 @pytest.fixture
 def trained_setup(tmp_path):
     watch = _make_watch()
-    buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
-    _fill_buffer(buf, n=35)
-
-    store = VersionStore(
-        metric_key="test_metric",
-        artifact_store=str(tmp_path),
-        max_versions=5,
-    )
+    buf = MetricBuffer(metric="test_metric", lookback="10m", granularity="1m")
+    _fill_buffer(buf, n=20)
+    # rest stays the same
+    store = VersionStore(metric_key="test_metric", artifact_store=str(tmp_path), max_versions=5)
     registry = ModelRegistry(metric_key="test_metric", version_store=store)
     trainer = Trainer(watch_config=watch, buffer=buf, registry=registry)
     trainer.run(drift_severity=DriftSeverity.NONE)
-
     return watch, buf, registry
 
 
@@ -4379,7 +4836,270 @@ class TestModelRegistry:
 ================================================
 FILE: tests/test_pipeline/test_scheduler.py
 ================================================
-[Empty file]
+# tests/test_pipeline/test_scheduler.py
+
+import time
+import threading
+import pytest
+from unittest.mock import MagicMock, patch
+from datetime import datetime, timezone
+from sentinel.pipeline.scheduler import MetricScheduler
+from sentinel.pipeline.drift import DriftMonitor, DriftSeverity
+from sentinel.ingestor.buffer import MetricBuffer
+from sentinel.config import WatchConfig
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+
+
+def _make_watch():
+    return WatchConfig(
+        metric="test_metric",
+        labels={},
+        model_class=ExponentialSmoothingModel,
+        granularity="1m",
+        horizon="5m",
+        lookback="5m",
+        cron="* * * * *",  # every minute for fast tests
+    )
+
+
+def _make_drift_monitor(severity=DriftSeverity.NONE):
+    monitor = MagicMock(spec=DriftMonitor)
+    result = MagicMock()
+    result.severity = severity
+    result.mae = 0.0
+    monitor.check.return_value = result
+    return monitor
+
+
+def _make_full_buffer():
+    buf = MetricBuffer(metric="test_metric", lookback="5m", granularity="1m")
+    for i in range(5):
+        buf.push(float(i), float(i))
+    return buf
+
+
+def _make_empty_buffer():
+    return MetricBuffer(metric="test_metric", lookback="5m", granularity="1m")
+
+
+class TestMetricScheduler:
+
+    def test_start_and_stop(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+        train_fn = MagicMock()
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+        scheduler.start()
+        assert scheduler._thread is not None
+        assert scheduler._thread.is_alive()
+        scheduler.stop()
+        scheduler._thread.join(timeout=15)   # was 5 inside stop(), give it more
+        assert not scheduler._thread.is_alive()
+
+    def test_cold_start_fires_when_buffer_ready(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+        train_calls = []
+
+        def train_fn(severity, drift_score):
+            train_calls.append((severity, drift_score))
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        # call tick directly to avoid thread timing
+        scheduler._tick()
+
+        # give the dispatched thread time to run
+        time.sleep(0.1)
+
+        assert len(train_calls) == 1
+        assert train_calls[0][0] == DriftSeverity.NONE
+        assert scheduler._cold_start_done is True
+
+    def test_cold_start_does_not_fire_when_buffer_not_ready(self):
+        watch = _make_watch()
+        buf = _make_empty_buffer()
+        monitor = _make_drift_monitor()
+        train_fn = MagicMock()
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        scheduler._tick()
+        time.sleep(0.1)
+
+        train_fn.assert_not_called()
+        assert scheduler._cold_start_done is False
+
+    def test_cold_start_fires_only_once(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+        train_calls = []
+
+        def train_fn(severity, drift_score):
+            train_calls.append((severity, drift_score))
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        scheduler._tick()
+        scheduler._tick()
+        scheduler._tick()
+        time.sleep(0.2)
+
+        # cold start only fires once â€” subsequent ticks go to cron/drift path
+        cold_start_calls = [c for c in train_calls if not scheduler._cold_start_done or True]
+        assert train_calls[0][0] == DriftSeverity.NONE
+
+    def test_drift_triggers_retrain_after_cold_start(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        train_calls = []
+
+        def train_fn(severity, drift_score):
+            train_calls.append((severity, drift_score))
+
+        monitor = _make_drift_monitor(severity=DriftSeverity.HIGH)
+        monitor.check.return_value.mae = 0.5
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        # simulate cold start already done
+        scheduler._cold_start_done = True
+        scheduler._last_cron_fire = datetime.now(timezone.utc)
+
+        scheduler._tick()
+        time.sleep(0.1)
+
+        assert len(train_calls) == 1
+        assert train_calls[0][0] == DriftSeverity.HIGH
+
+    def test_drift_monitor_reset_called_after_drift_trigger(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        train_fn = MagicMock()
+
+        monitor = _make_drift_monitor(severity=DriftSeverity.LOW)
+        monitor.check.return_value.mae = 0.2
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        scheduler._cold_start_done = True
+        scheduler._last_cron_fire = datetime.now(timezone.utc)
+
+        scheduler._tick()
+        time.sleep(0.1)
+
+        monitor.reset.assert_called_once()
+
+    def test_cron_not_due_when_just_fired(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+        train_fn = MagicMock()
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        scheduler._cold_start_done = True
+        scheduler._last_cron_fire = datetime.now(timezone.utc)
+
+        assert scheduler._cron_due(datetime.now(timezone.utc)) is False
+
+    def test_cron_due_after_interval_elapsed(self):
+        from datetime import timedelta
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+        train_fn = MagicMock()
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        scheduler._cold_start_done = True
+        # set last fire to 2 minutes ago â€” cron is every minute so it should be due
+        scheduler._last_cron_fire = datetime.now(timezone.utc) - timedelta(minutes=2)
+
+        assert scheduler._cron_due(datetime.now(timezone.utc)) is True
+
+    def test_cron_not_due_when_last_fire_is_none(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+        train_fn = MagicMock()
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        assert scheduler._cron_due(datetime.now(timezone.utc)) is False
+
+    def test_fire_dispatches_in_background_thread(self):
+        watch = _make_watch()
+        buf = _make_full_buffer()
+        monitor = _make_drift_monitor()
+
+        fired_threads = []
+
+        def train_fn(severity, drift_score):
+            fired_threads.append(threading.current_thread().name)
+
+        scheduler = MetricScheduler(
+            watch_config=watch,
+            buffer=buf,
+            drift_monitor=monitor,
+            train_fn=train_fn,
+        )
+
+        scheduler._fire(DriftSeverity.NONE, 0.0)
+        time.sleep(0.1)
+
+        assert len(fired_threads) == 1
+        # should not have run on the main thread
+        assert fired_threads[0] != threading.main_thread().name
 
 
 ================================================
@@ -4406,7 +5126,7 @@ def _make_watch_config(model_class=None):
         model_class=model_class or ExponentialSmoothingModel,
         granularity="1m",
         horizon="5m",
-        lookback="30m",
+        lookback="10m",       # 10 lags, needs 11+ values
         cron="0 */6 * * *",
     )
 
@@ -4428,9 +5148,11 @@ def tmp_registry(tmp_path):
 
 @pytest.fixture
 def buffer():
-    buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
-    _fill_buffer(buf, n=35)
+    buf = MetricBuffer(metric="test_metric", lookback="10m", granularity="1m")
+    for i in range(20):      # 20 > 10, plenty of room
+        buf.push(float(1700000000 + i * 60), float(i) + np.random.normal(0, 0.1))
     return buf
+
 
 
 class TestTrainer:

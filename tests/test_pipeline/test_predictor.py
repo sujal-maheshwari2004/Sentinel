@@ -32,9 +32,10 @@ def _fill_buffer(buf, n=20):   # was 35
 @pytest.fixture
 def trained_setup(tmp_path):
     watch = _make_watch()
-    buf = MetricBuffer(metric="test_metric", lookback="10m", granularity="1m")
-    _fill_buffer(buf, n=20)
-    # rest stays the same
+    # buffer bigger than lookback so trainer has samples beyond n_lags
+    buf = MetricBuffer(metric="test_metric", lookback="20m", granularity="1m")
+    for i in range(20):
+        buf.push(float(1700000000 + i * 60), float(i) + np.random.normal(0, 0.1))
     store = VersionStore(metric_key="test_metric", artifact_store=str(tmp_path), max_versions=5)
     registry = ModelRegistry(metric_key="test_metric", version_store=store)
     trainer = Trainer(watch_config=watch, buffer=buf, registry=registry)
