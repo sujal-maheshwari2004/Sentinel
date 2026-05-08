@@ -192,11 +192,11 @@ class TestEmitterServer:
         server.register(emitter1)
         server.register(emitter2)
 
-        # run one iteration of loop manually
-        server._stop_event.set()  # stop after one pass
+        # patch sleep and stop after first pass by setting event inside sleep
+        def stop_after_one(*args, **kwargs):
+            server._stop_event.set()
 
-        # patch sleep to avoid waiting
-        with patch("sentinel.emitter.server.time.sleep"):
+        with patch("sentinel.emitter.server.time.sleep", side_effect=stop_after_one):
             server._loop()
 
         emitter1.tick.assert_called_once()
@@ -215,10 +215,11 @@ class TestEmitterServer:
         server.register(bad_emitter)
         server.register(good_emitter)
 
-        server._stop_event.set()
+        def stop_after_one(*args, **kwargs):
+            server._stop_event.set()
 
-        with patch("sentinel.emitter.server.time.sleep"):
-            server._loop()  # should not raise
+        with patch("sentinel.emitter.server.time.sleep", side_effect=stop_after_one):
+            server._loop()
 
         good_emitter.tick.assert_called_once()
 

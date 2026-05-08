@@ -19,7 +19,7 @@ def _make_watch_config(model_class=None):
         model_class=model_class or ExponentialSmoothingModel,
         granularity="1m",
         horizon="5m",
-        lookback="30m",
+        lookback="10m",       # 10 lags, needs 11+ values
         cron="0 */6 * * *",
     )
 
@@ -41,9 +41,11 @@ def tmp_registry(tmp_path):
 
 @pytest.fixture
 def buffer():
-    buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
-    _fill_buffer(buf, n=35)
+    buf = MetricBuffer(metric="test_metric", lookback="10m", granularity="1m")
+    for i in range(20):      # 20 > 10, plenty of room
+        buf.push(float(1700000000 + i * 60), float(i) + np.random.normal(0, 0.1))
     return buf
+
 
 
 class TestTrainer:

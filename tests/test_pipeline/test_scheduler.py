@@ -62,6 +62,7 @@ class TestMetricScheduler:
         assert scheduler._thread is not None
         assert scheduler._thread.is_alive()
         scheduler.stop()
+        scheduler._thread.join(timeout=15)   # was 5 inside stop(), give it more
         assert not scheduler._thread.is_alive()
 
     def test_cold_start_fires_when_buffer_ready(self):
