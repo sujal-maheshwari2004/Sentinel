@@ -1,0 +1,420 @@
+Directory structure:
+└── sentinel/
+    ├── README.md
+    ├── main.py
+    ├── pyproject.toml
+    ├── run.ps1
+    ├── .python-version
+    ├── sentinel/
+    │   ├── __init__.py
+    │   ├── config.py
+    │   ├── core.py
+    │   ├── emitter/
+    │   │   ├── __init__.py
+    │   │   ├── formatter.py
+    │   │   └── server.py
+    │   ├── ingestor/
+    │   │   ├── __init__.py
+    │   │   ├── buffer.py
+    │   │   ├── features.py
+    │   │   └── scraper.py
+    │   ├── pipeline/
+    │   │   ├── __init__.py
+    │   │   ├── drift.py
+    │   │   ├── predictor.py
+    │   │   ├── registry.py
+    │   │   ├── scheduler.py
+    │   │   ├── trainer.py
+    │   │   ├── versioning.py
+    │   │   └── models/
+    │   │       ├── __init__.py
+    │   │       ├── arima.py
+    │   │       ├── base.py
+    │   │       ├── linear.py
+    │   │       ├── sgd.py
+    │   │       └── smoothing.py
+    │   └── utils/
+    │       ├── __init__.py
+    │       ├── cron.py
+    │       ├── logging.py
+    │       ├── time.py
+    │       └── validation.py
+    └── tests/
+        ├── __init__.py
+        ├── test_emitter/
+        │   ├── test_formatter.py
+        │   └── test_server.py
+        ├── test_ingestor/
+        │   ├── test_buffer.py
+        │   ├── test_features.py
+        │   └── test_scraper.py
+        ├── test_pipeline/
+        │   ├── test_drift.py
+        │   ├── test_predictor.py
+        │   ├── test_registry.py
+        │   ├── test_scheduler.py
+        │   └── test_trainer.py
+        └── test_utils/
+            ├── test_cron.py
+            └── test_time.py
+
+================================================
+FILE: README.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: main.py
+================================================
+def main():
+    print("Hello from sentinal!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[project]
+name = "sentinel"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+
+
+================================================
+FILE: run.ps1
+================================================
+$base = "."
+
+$dirs = @(
+    "sentinel/ingestor",
+    "sentinel/pipeline/models",
+    "sentinel/emitter",
+    "sentinel/utils",
+    "tests/test_ingestor",
+    "tests/test_pipeline",
+    "tests/test_emitter",
+    "tests/test_utils"
+)
+
+$files = @(
+    "sentinel/__init__.py",
+    "sentinel/core.py",
+    "sentinel/config.py",
+
+    "sentinel/ingestor/__init__.py",
+    "sentinel/ingestor/scraper.py",
+    "sentinel/ingestor/buffer.py",
+    "sentinel/ingestor/features.py",
+
+    "sentinel/pipeline/__init__.py",
+    "sentinel/pipeline/scheduler.py",
+    "sentinel/pipeline/trainer.py",
+    "sentinel/pipeline/predictor.py",
+    "sentinel/pipeline/drift.py",
+    "sentinel/pipeline/registry.py",
+    "sentinel/pipeline/versioning.py",
+
+    "sentinel/pipeline/models/__init__.py",
+    "sentinel/pipeline/models/base.py",
+    "sentinel/pipeline/models/linear.py",
+    "sentinel/pipeline/models/smoothing.py",
+    "sentinel/pipeline/models/arima.py",
+    "sentinel/pipeline/models/sgd.py",
+
+    "sentinel/emitter/__init__.py",
+    "sentinel/emitter/formatter.py",
+    "sentinel/emitter/server.py",
+
+    "sentinel/utils/__init__.py",
+    "sentinel/utils/cron.py",
+    "sentinel/utils/time.py",
+    "sentinel/utils/logging.py",
+    "sentinel/utils/validation.py",
+
+    "tests/__init__.py",
+    "tests/test_ingestor/test_scraper.py",
+    "tests/test_ingestor/test_buffer.py",
+    "tests/test_ingestor/test_features.py",
+    "tests/test_pipeline/test_scheduler.py",
+    "tests/test_pipeline/test_trainer.py",
+    "tests/test_pipeline/test_predictor.py",
+    "tests/test_pipeline/test_drift.py",
+    "tests/test_pipeline/test_registry.py",
+    "tests/test_emitter/test_formatter.py",
+    "tests/test_emitter/test_server.py",
+    "tests/test_utils/test_cron.py",
+    "tests/test_utils/test_time.py"
+)
+
+foreach ($dir in $dirs) {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+}
+
+foreach ($file in $files) {
+    New-Item -ItemType File -Force -Path $file | Out-Null
+}
+
+Write-Host "Sentinel scaffolded successfully."
+
+
+================================================
+FILE: .python-version
+================================================
+3.14
+
+
+
+================================================
+FILE: sentinel/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/config.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/core.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/emitter/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/emitter/formatter.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/emitter/server.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/ingestor/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/ingestor/buffer.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/ingestor/features.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/ingestor/scraper.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/drift.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/predictor.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/registry.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/scheduler.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/trainer.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/versioning.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/models/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/models/arima.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/models/base.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/models/linear.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/models/sgd.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/pipeline/models/smoothing.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/utils/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/utils/cron.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/utils/logging.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/utils/time.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: sentinel/utils/validation.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_emitter/test_formatter.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_emitter/test_server.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_ingestor/test_buffer.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_ingestor/test_features.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_ingestor/test_scraper.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_pipeline/test_drift.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_pipeline/test_predictor.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_pipeline/test_registry.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_pipeline/test_scheduler.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_pipeline/test_trainer.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_utils/test_cron.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/test_utils/test_time.py
+================================================
+[Empty file]
+
