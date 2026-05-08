@@ -81,11 +81,29 @@ FILE: pyproject.toml
 [project]
 name = "sentinel"
 version = "0.1.0"
-description = "Add your description here"
+description = "MLOps pipeline sitting between Prometheus and Grafana â€” pulls metrics, trains models, emits predictions"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "numpy>=1.26.0",
+    "httpx>=0.27.0",
+    "joblib>=1.3.0",
+    "prometheus-client>=0.20.0",
+    "croniter>=2.0.0",
+]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 
 ================================================
@@ -98,7 +116,28 @@ FILE: .python-version
 ================================================
 FILE: sentinel/__init__.py
 ================================================
-[Empty file]
+# sentinel/__init__.py
+
+from sentinel.core import Sentinel
+from sentinel.config import SentinelConfig, WatchConfig
+from sentinel.pipeline.models import (
+    BaseModel,
+    LinearTrendModel,
+    ExponentialSmoothingModel,
+    ARIMAModel,
+    SGDRegressorModel,
+)
+
+__all__ = [
+    "Sentinel",
+    "SentinelConfig",
+    "WatchConfig",
+    "BaseModel",
+    "LinearTrendModel",
+    "ExponentialSmoothingModel",
+    "ARIMAModel",
+    "SGDRegressorModel",
+]
 
 
 ================================================
@@ -180,240 +219,2322 @@ class SentinelConfig:
 ================================================
 FILE: sentinel/core.py
 ================================================
-# sentinel/pipeline/models/base.py
+# sentinel/core.py
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Optional
-import numpy as np
+import threading
+import time
+from datetime import datetime, timezone, timedelta
+from sentinel.config import SentinelConfig, WatchConfig
+from sentinel.ingestor.scraper import PrometheusScraper
+from sentinel.ingestor.buffer import BufferRegistry
+from sentinel.pipeline.drift import DriftMonitor
+from sentinel.pipeline.versioning import VersionStore
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.trainer import Trainer
+from sentinel.pipeline.predictor import Predictor
+from sentinel.pipeline.scheduler import MetricScheduler
+from sentinel.emitter.server import EmitterServer, MetricEmitter
+from sentinel.utils.validation import validate_sentinel_config
+from sentinel.utils.logging import get_logger, configure_logging
+from sentinel.utils.time import parse_duration_to_seconds
+
+logger = get_logger(__name__)
+
+# how often the ingestor pulls fresh data from Prometheus
+_INGESTOR_TICK_SECONDS = 10
 
 
-@dataclass
-class PredictionResult:
+class Sentinel:
     """
-    Returned by every model's predict() call.
-    horizon_steps mirrors the number of steps ahead requested.
-    """
+    Top-level orchestrator. Wires together all three parts:
 
-    # predicted values, length = horizon_steps
-    values: np.ndarray
+        Data Ingestor  â€” scrapes Prometheus, fills buffers
+        MLOps Pipeline â€” trains, predicts, monitors drift, schedules retraining
+        Data Emitter   â€” serves /metrics with predictions for Grafana
 
-    # timestamps corresponding to each predicted value
-    timestamps: np.ndarray
+    Usage:
 
-    # optional lower and upper confidence bounds, same length as values
-    lower_bound: Optional[np.ndarray] = None
-    upper_bound: Optional[np.ndarray] = None
+        from sentinel import Sentinel
+        from sentinel.config import SentinelConfig, WatchConfig
+        from sentinel.pipeline.models import ExponentialSmoothingModel
 
-    # model version that produced this prediction
-    model_version: Optional[str] = None
-
-
-@dataclass
-class TrainingResult:
-    """
-    Returned by every model's fit() and partial_fit() calls.
-    Used by versioning and registry to record what happened.
-    """
-
-    # validation MAE on holdout set
-    mae: float
-
-    # validation MAPE on holdout set
-    mape: float
-
-    # number of samples trained on
-    n_samples: int
-
-    # whether this was a full retrain or finetune
-    training_policy: str  # "full_retrain" or "finetune"
-
-    # any model-specific metadata worth logging
-    extra: dict = field(default_factory=dict)
-
-
-class BaseModel(ABC):
-    """
-    Interface every Sentinel model must implement.
-
-    Sentinel calls these methods in this order:
-        1. fit()         â€” cold start, full retrain
-        2. predict()     â€” called on every emitter tick
-        3. partial_fit() â€” called on finetune trigger
-        4. save()        â€” called after fit/partial_fit, before promotion
-        5. load()        â€” called on startup if artifact exists
-
-    Models must be stateless between calls except for internal
-    learned parameters. All state that needs to persist across
-    restarts must be serialized by save() and restored by load().
-    """
-
-    def __init__(self, granularity: str, horizon: str, lookback: str):
-        """
-        granularity : resolution of input data e.g. "1m"
-        horizon     : how far ahead to predict e.g. "5m"
-        lookback    : size of feature window e.g. "30m"
-
-        Subclasses should call super().__init__() and then
-        initialize their own internal parameters.
-        """
-        self.granularity = granularity
-        self.horizon = horizon
-        self.lookback = lookback
-        self._is_fitted = False
-
-    @abstractmethod
-    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
-        """
-        Full retrain from scratch on the provided data.
-
-        X : feature matrix, shape (n_samples, n_features)
-            features are lag values auto-generated by features.py
-        y : target values, shape (n_samples,)
-            the actual metric values to predict
-
-        Must set self._is_fitted = True on success.
-        Must return a TrainingResult.
-        """
-        ...
-
-    @abstractmethod
-    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
-        """
-        Finetune on recent data without discarding learned parameters.
-        Called on low severity drift.
-
-        Falls back to full fit() if model has not been fitted yet.
-        Must return a TrainingResult with training_policy="finetune".
-        """
-        ...
-
-    @abstractmethod
-    def predict(self, X: np.ndarray) -> PredictionResult:
-        """
-        Generate multi-step ahead predictions.
-
-        X : most recent feature window, shape (1, n_features)
-            represents the latest observed state
-
-        Returns PredictionResult with len(values) == horizon_steps.
-        horizon_steps is derived from horizon / granularity internally.
-        """
-        ...
-
-    @abstractmethod
-    def save(self, path: str) -> None:
-        """
-        Serialize model state to the given path.
-        Path is managed by versioning.py, model just writes to it.
-        Format is up to the subclass â€” joblib, pickle, json etc.
-        """
-        ...
-
-    @abstractmethod
-    def load(self, path: str) -> None:
-        """
-        Restore model state from the given path.
-        Must set self._is_fitted = True on success.
-        """
-        ...
-
-    @property
-    def is_fitted(self) -> bool:
-        return self._is_fitted
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}("
-            f"granularity={self.granularity}, "
-            f"horizon={self.horizon}, "
-            f"lookback={self.lookback}, "
-            f"fitted={self._is_fitted})"
+        config = SentinelConfig(
+            prometheus_url="http://localhost:9090",
+            emitter_port=8080,
+            watches=[
+                WatchConfig(
+                    metric="http_request_duration_seconds",
+                    labels={"job": "api"},
+                    model_class=ExponentialSmoothingModel,
+                    granularity="1m",
+                    horizon="5m",
+                    lookback="30m",
+                    cron="0 */6 * * *",
+                )
+            ]
         )
+
+        sentinel = Sentinel(config)
+        sentinel.start()
+    """
+
+    def __init__(self, config: SentinelConfig, log_level: str = "INFO"):
+        configure_logging(log_level)
+        validate_sentinel_config(config)
+
+        self.config = config
+        self._stop_event = threading.Event()
+
+        # shared scraper â€” one HTTP client for all metrics
+        self._scraper = PrometheusScraper(
+            prometheus_url=config.prometheus_url,
+            timeout=config.scrape_timeout,
+        )
+
+        # shared buffer registry
+        self._buffer_registry = BufferRegistry()
+
+        # per-metric components
+        self._drift_monitors: dict[str, DriftMonitor] = {}
+        self._registries: dict[str, ModelRegistry] = {}
+        self._trainers: dict[str, Trainer] = {}
+        self._predictors: dict[str, Predictor] = {}
+        self._schedulers: dict[str, MetricScheduler] = {}
+
+        # emitter server
+        self._emitter_server = EmitterServer(config)
+
+        # ingestor background thread
+        self._ingestor_thread: threading.Thread = None
+
+        self._setup()
+
+    def _setup(self) -> None:
+        """
+        Instantiate and wire all per-metric components.
+        """
+        for watch in self.config.watches:
+            key = self._metric_key(watch)
+
+            # buffer
+            buffer = self._buffer_registry.register(
+                key=key,
+                metric=watch.metric,
+                lookback=watch.lookback,
+                granularity=watch.granularity,
+            )
+
+            # drift monitor
+            drift_monitor = DriftMonitor(
+                metric=key,
+                finetune_threshold=watch.drift_finetune_threshold,
+                retrain_threshold=watch.drift_retrain_threshold,
+            )
+            self._drift_monitors[key] = drift_monitor
+
+            # version store + model registry
+            version_store = VersionStore(
+                metric_key=key,
+                artifact_store=self.config.artifact_store,
+                max_versions=self.config.max_versions_per_metric,
+            )
+            registry = ModelRegistry(metric_key=key, version_store=version_store)
+            self._registries[key] = registry
+
+            # attempt to restore model from disk so we don't cold start
+            # on every restart if a trained model already exists
+            def make_factory(w):
+                def factory():
+                    return w.model_class(
+                        granularity=w.granularity,
+                        horizon=w.horizon,
+                        lookback=w.lookback,
+                    )
+                return factory
+
+            registry.restore_from_disk(make_factory(watch))
+
+            # trainer
+            trainer = Trainer(
+                watch_config=watch,
+                buffer=buffer,
+                registry=registry,
+            )
+            self._trainers[key] = trainer
+
+            # predictor
+            predictor = Predictor(
+                watch_config=watch,
+                buffer=buffer,
+                registry=registry,
+            )
+            self._predictors[key] = predictor
+
+            # scheduler
+            def make_train_fn(t):
+                def train_fn(severity, drift_score):
+                    t.run(drift_severity=severity, drift_score=drift_score)
+                return train_fn
+
+            scheduler = MetricScheduler(
+                watch_config=watch,
+                buffer=buffer,
+                drift_monitor=drift_monitor,
+                train_fn=make_train_fn(trainer),
+            )
+            self._schedulers[key] = scheduler
+
+            # emitter
+            emitter = MetricEmitter(
+                watch_config=watch,
+                predictor=predictor,
+                drift_monitor=drift_monitor,
+                scraper=self._scraper,
+                emit_confidence_bounds=self.config.emit_confidence_bounds,
+            )
+            self._emitter_server.register(emitter)
+
+            logger.info(f"Sentinel wired up metric: {key}")
+
+    def start(self) -> None:
+        """
+        Start all components. Blocks until stop() is called.
+        """
+        if not self._scraper.check_connectivity():
+            raise RuntimeError(
+                f"Cannot reach Prometheus at {self.config.prometheus_url}. "
+                f"Check the URL and ensure Prometheus is running."
+            )
+
+        logger.info("Sentinel starting...")
+
+        # start schedulers
+        for scheduler in self._schedulers.values():
+            scheduler.start()
+
+        # start ingestor loop
+        self._ingestor_thread = threading.Thread(
+            target=self._ingestor_loop,
+            name="ingestor",
+            daemon=True,
+        )
+        self._ingestor_thread.start()
+
+        # start emitter server
+        self._emitter_server.start()
+
+        logger.info(
+            f"Sentinel running. "
+            f"Watching {len(self.config.watches)} metric(s). "
+            f"Emitting on port {self.config.emitter_port}."
+        )
+
+        # block main thread
+        try:
+            while not self._stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt received, shutting down...")
+            self.stop()
+
+    def stop(self) -> None:
+        """
+        Gracefully stop all components.
+        """
+        logger.info("Sentinel stopping...")
+        self._stop_event.set()
+
+        for scheduler in self._schedulers.values():
+            scheduler.stop()
+
+        self._emitter_server.stop()
+        self._scraper.close()
+
+        logger.info("Sentinel stopped.")
+
+    def rollback(self, metric: str, labels: dict[str, str] = None) -> bool:
+        """
+        Manually roll back the model for a given metric to the previous version.
+        Returns True if rollback succeeded.
+        """
+        key = self._metric_key_from_parts(metric, labels or {})
+        registry = self._registries.get(key)
+        if registry is None:
+            logger.error(f"No registry found for metric key '{key}'")
+            return False
+        return registry.rollback()
+
+    def status(self) -> dict:
+        """
+        Returns a snapshot of current state for all watched metrics.
+        Useful for health checks and debugging.
+        """
+        result = {}
+        for watch in self.config.watches:
+            key = self._metric_key(watch)
+            registry = self._registries.get(key)
+            drift = self._drift_monitors.get(key)
+            buffer = self._buffer_registry.get(key)
+            active_version = registry.active_version() if registry else None
+
+            result[key] = {
+                "ready": registry.is_ready() if registry else False,
+                "active_version": active_version.version_id if active_version else None,
+                "active_version_mae": active_version.mae if active_version else None,
+                "drift_mae": drift.current_mae() if drift else None,
+                "buffer_fill": buffer.fill_fraction() if buffer else None,
+            }
+        return result
+
+    def _ingestor_loop(self) -> None:
+        """
+        Continuously pulls fresh data from Prometheus for all watched metrics
+        and pushes it into the corresponding buffers.
+        """
+        while not self._stop_event.is_set():
+            for watch in self.config.watches:
+                try:
+                    self._ingestor_tick(watch)
+                except Exception as e:
+                    logger.error(f"Ingestor tick failed for {watch.metric}: {e}")
+            time.sleep(_INGESTOR_TICK_SECONDS)
+
+    def _ingestor_tick(self, watch: WatchConfig) -> None:
+        key = self._metric_key(watch)
+        buffer = self._buffer_registry.get(key)
+
+        if buffer is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        granularity_secs = parse_duration_to_seconds(watch.granularity)
+
+        # pull just the last two granularity steps to stay current
+        start = now - timedelta(seconds=granularity_secs * 2)
+
+        samples = self._scraper.fetch_range(
+            metric=watch.metric,
+            labels=watch.labels,
+            start=start,
+            end=now,
+            granularity=watch.granularity,
+        )
+
+        if samples:
+            buffer.push_many(samples)
+            logger.debug(f"[{key}] ingestor pushed {len(samples)} new samples")
+
+    def _initial_backfill(self, watch: WatchConfig) -> None:
+        """
+        On startup, backfill the buffer with historical data
+        covering the full lookback window so cold start training
+        can begin as soon as possible.
+        """
+        key = self._metric_key(watch)
+        buffer = self._buffer_registry.get(key)
+
+        if buffer is None or buffer.is_ready():
+            return
+
+        now = datetime.now(timezone.utc)
+        lookback_secs = parse_duration_to_seconds(watch.lookback)
+        start = now - timedelta(seconds=lookback_secs)
+
+        logger.info(f"[{key}] backfilling {watch.lookback} of historical data...")
+
+        samples = self._scraper.fetch_range(
+            metric=watch.metric,
+            labels=watch.labels,
+            start=start,
+            end=now,
+            granularity=watch.granularity,
+        )
+
+        if samples:
+            buffer.push_many(samples)
+            logger.info(f"[{key}] backfill complete â€” {len(samples)} samples loaded")
+        else:
+            logger.warning(f"[{key}] backfill returned no data from Prometheus")
+
+    @staticmethod
+    def _metric_key(watch: WatchConfig) -> str:
+        if not watch.labels:
+            return watch.metric
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(watch.labels.items()))
+        return f"{watch.metric}{{{label_str}}}"
+
+    @staticmethod
+    def _metric_key_from_parts(metric: str, labels: dict[str, str]) -> str:
+        if not labels:
+            return metric
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        return f"{metric}{{{label_str}}}"
 
 
 ================================================
 FILE: sentinel/emitter/__init__.py
 ================================================
-[Empty file]
+# sentinel/emitter/__init__.py
+
+from sentinel.emitter.formatter import (
+    format_prediction,
+    FormattedPrediction,
+    build_metric_key,
+)
+from sentinel.emitter.server import MetricEmitter, EmitterServer
+
+__all__ = [
+    "format_prediction",
+    "FormattedPrediction",
+    "build_metric_key",
+    "MetricEmitter",
+    "EmitterServer",
+]
 
 
 ================================================
 FILE: sentinel/emitter/formatter.py
 ================================================
-[Empty file]
+# sentinel/emitter/formatter.py
+
+import time
+import numpy as np
+from datetime import datetime, timezone
+from sentinel.pipeline.models.base import PredictionResult
+from sentinel.config import WatchConfig
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# sentinel appends this suffix to the original metric name
+_PREDICTION_SUFFIX = "_sentinel_predicted"
+_LOWER_BOUND_SUFFIX = "_sentinel_predicted_lower"
+_UPPER_BOUND_SUFFIX = "_sentinel_predicted_upper"
+
+
+class FormattedPrediction:
+    """
+    Holds a set of Prometheus-ready metric samples derived from
+    a single PredictionResult. One FormattedPrediction per watched metric
+    per emitter tick.
+    """
+
+    def __init__(
+        self,
+        metric_name: str,
+        labels: dict[str, str],
+        steps: list[dict],
+    ):
+        """
+        metric_name : base predicted metric name e.g. "http_request_duration_seconds_sentinel_predicted"
+        labels      : label set carried over from the original metric plus sentinel metadata labels
+        steps       : list of {"timestamp": float, "value": float, "step": int}
+        """
+        self.metric_name = metric_name
+        self.labels = labels
+        self.steps = steps
+
+    def __repr__(self) -> str:
+        return (
+            f"FormattedPrediction(metric={self.metric_name}, "
+            f"labels={self.labels}, steps={len(self.steps)})"
+        )
+
+
+def format_prediction(
+    watch_config: WatchConfig,
+    result: PredictionResult,
+    emit_confidence_bounds: bool = False,
+) -> list[FormattedPrediction]:
+    """
+    Convert a PredictionResult into a list of FormattedPredictions
+    ready to be registered as Prometheus gauges.
+
+    One FormattedPrediction is always produced for the predicted values.
+    Two more are produced if emit_confidence_bounds=True and bounds exist.
+
+    Labels added by Sentinel on top of the original metric labels:
+        sentinel_horizon : prediction horizon string e.g. "5m"
+        sentinel_version : model version id e.g. "v3"
+        sentinel_step    : step index within the horizon (1-indexed)
+    """
+    base_labels = dict(watch_config.labels)
+    version = result.model_version or "unknown"
+    output = []
+
+    predicted_steps = []
+    for i, (val, ts) in enumerate(zip(result.values, result.timestamps)):
+        predicted_steps.append({
+            "timestamp": float(ts),
+            "value": float(val),
+            "step": i + 1,
+        })
+
+    output.append(FormattedPrediction(
+        metric_name=watch_config.metric + _PREDICTION_SUFFIX,
+        labels={
+            **base_labels,
+            "sentinel_horizon": watch_config.horizon,
+            "sentinel_version": version,
+        },
+        steps=predicted_steps,
+    ))
+
+    if emit_confidence_bounds and result.lower_bound is not None and result.upper_bound is not None:
+        lower_steps = []
+        upper_steps = []
+        for i, (lo, hi, ts) in enumerate(zip(result.lower_bound, result.upper_bound, result.timestamps)):
+            lower_steps.append({"timestamp": float(ts), "value": float(lo), "step": i + 1})
+            upper_steps.append({"timestamp": float(ts), "value": float(hi), "step": i + 1})
+
+        output.append(FormattedPrediction(
+            metric_name=watch_config.metric + _LOWER_BOUND_SUFFIX,
+            labels={**base_labels, "sentinel_horizon": watch_config.horizon, "sentinel_version": version},
+            steps=lower_steps,
+        ))
+
+        output.append(FormattedPrediction(
+            metric_name=watch_config.metric + _UPPER_BOUND_SUFFIX,
+            labels={**base_labels, "sentinel_horizon": watch_config.horizon, "sentinel_version": version},
+            steps=upper_steps,
+        ))
+
+    return output
+
+
+def build_metric_key(metric: str, labels: dict[str, str]) -> str:
+    """
+    Build a unique string key for a metric+labelset combination.
+    Used by the server to look up and update the correct Gauge.
+    """
+    if not labels:
+        return metric
+    label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+    return f"{metric}{{{label_str}}}"
 
 
 ================================================
 FILE: sentinel/emitter/server.py
 ================================================
-[Empty file]
+# sentinel/emitter/server.py
+
+import threading
+import time
+from typing import Optional
+from prometheus_client import Gauge, CollectorRegistry, start_http_server, REGISTRY
+from sentinel.emitter.formatter import format_prediction, FormattedPrediction, build_metric_key
+from sentinel.pipeline.predictor import Predictor
+from sentinel.pipeline.drift import DriftMonitor
+from sentinel.ingestor.scraper import PrometheusScraper
+from sentinel.config import WatchConfig, SentinelConfig
+from sentinel.utils.time import parse_duration_to_seconds
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# how often the emitter tick runs in seconds
+_EMITTER_TICK_SECONDS = 10
+
+
+class MetricEmitter:
+    """
+    Manages the Prometheus Gauge objects for a single watched metric
+    and updates them on each emitter tick.
+
+    One Gauge per prediction step within the horizon. Each Gauge carries
+    the step index as a label so Grafana can plot all horizon steps
+    on the same panel or separately.
+
+    Also handles feeding actual values back to the DriftMonitor
+    so drift detection has ground truth to compare against.
+    """
+
+    def __init__(
+        self,
+        watch_config: WatchConfig,
+        predictor: Predictor,
+        drift_monitor: DriftMonitor,
+        scraper: PrometheusScraper,
+        emit_confidence_bounds: bool = False,
+        registry: CollectorRegistry = REGISTRY,
+    ):
+        self.watch_config = watch_config
+        self.predictor = predictor
+        self.drift_monitor = drift_monitor
+        self.scraper = scraper
+        self.emit_confidence_bounds = emit_confidence_bounds
+        self._registry = registry
+
+        # gauge_key -> Gauge
+        self._gauges: dict[str, Gauge] = {}
+        self._gauge_lock = threading.Lock()
+
+        # last set of predictions keyed by step for drift comparison
+        # step -> (predicted_value, predicted_timestamp)
+        self._pending_predictions: dict[int, tuple[float, float]] = {}
+        self._pending_lock = threading.Lock()
+
+    def tick(self) -> None:
+        """
+        Run one emitter cycle:
+            1. Run inference via Predictor
+            2. Format predictions
+            3. Update Gauges
+            4. Feed actual values to DriftMonitor for past predictions
+        """
+        self._feed_drift_actuals()
+
+        result = self.predictor.predict()
+        if result is None:
+            logger.debug(f"[{self.watch_config.metric}] no prediction available this tick")
+            return
+
+        formatted_list = format_prediction(
+            watch_config=self.watch_config,
+            result=result,
+            emit_confidence_bounds=self.emit_confidence_bounds,
+        )
+
+        for formatted in formatted_list:
+            self._update_gauges(formatted)
+
+        # store predictions for drift comparison on next ticks
+        with self._pending_lock:
+            for step_data in formatted_list[0].steps:  # use main prediction series
+                step = step_data["step"]
+                self._pending_predictions[step] = (
+                    step_data["value"],
+                    step_data["timestamp"],
+                )
+
+    def _update_gauges(self, formatted: FormattedPrediction) -> None:
+        """
+        For each step in the prediction, set the corresponding Gauge value.
+        Creates the Gauge lazily on first encounter.
+        """
+        for step_data in formatted.steps:
+            step = step_data["step"]
+            value = step_data["value"]
+
+            labels_with_step = {**formatted.labels, "sentinel_step": str(step)}
+            gauge_key = build_metric_key(formatted.metric_name, labels_with_step)
+
+            gauge = self._get_or_create_gauge(
+                gauge_key=gauge_key,
+                metric_name=formatted.metric_name,
+                label_names=list(labels_with_step.keys()),
+            )
+
+            try:
+                gauge.labels(**labels_with_step).set(value)
+            except Exception as e:
+                logger.error(f"Failed to set gauge '{gauge_key}': {e}")
+
+    def _get_or_create_gauge(
+        self,
+        gauge_key: str,
+        metric_name: str,
+        label_names: list[str],
+    ) -> Gauge:
+        with self._gauge_lock:
+            if gauge_key not in self._gauges:
+                # sanitize metric name for Prometheus â€” only alphanumeric and underscores
+                safe_name = metric_name.replace(".", "_").replace("-", "_")
+                try:
+                    g = Gauge(
+                        name=safe_name,
+                        documentation=f"Sentinel prediction for {self.watch_config.metric}",
+                        labelnames=label_names,
+                        registry=self._registry,
+                    )
+                    self._gauges[gauge_key] = g
+                    logger.debug(f"Created Gauge '{safe_name}' with labels {label_names}")
+                except ValueError:
+                    # Gauge already registered (e.g. after hot reload), fetch existing
+                    self._gauges[gauge_key] = self._registry._names_to_collectors.get(safe_name)
+            return self._gauges[gauge_key]
+
+    def _feed_drift_actuals(self) -> None:
+        """
+        For each pending prediction whose timestamp has now passed,
+        fetch the actual value from Prometheus and record the residual
+        in the DriftMonitor.
+        """
+        now = time.time()
+        due_steps = []
+
+        with self._pending_lock:
+            for step, (predicted_val, predicted_ts) in list(self._pending_predictions.items()):
+                if predicted_ts <= now:
+                    due_steps.append((step, predicted_val, predicted_ts))
+
+            for step, _, _ in due_steps:
+                del self._pending_predictions[step]
+
+        for step, predicted_val, predicted_ts in due_steps:
+            actual = self.scraper.fetch_latest(
+                metric=self.watch_config.metric,
+                labels=self.watch_config.labels,
+            )
+            if actual is not None:
+                _, actual_val = actual
+                self.drift_monitor.record(predicted_val, actual_val)
+                logger.debug(
+                    f"[{self.watch_config.metric}] drift record step={step} "
+                    f"predicted={predicted_val:.4f} actual={actual_val:.4f}"
+                )
+
+
+class EmitterServer:
+    """
+    Runs the /metrics HTTP server and orchestrates all MetricEmitters.
+    One EmitterServer per Sentinel instance.
+
+    On each tick it calls tick() on every MetricEmitter in a loop.
+    The HTTP server is started once and serves all registered Gauges
+    via prometheus_client's built-in exposition.
+    """
+
+    def __init__(self, config: SentinelConfig):
+        self.config = config
+        self._emitters: list[MetricEmitter] = []
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def register(self, emitter: MetricEmitter) -> None:
+        self._emitters.append(emitter)
+
+    def start(self) -> None:
+        """
+        Start the /metrics HTTP server and the emitter loop thread.
+        """
+        start_http_server(self.config.emitter_port)
+        logger.info(f"Sentinel /metrics server started on port {self.config.emitter_port}")
+
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="emitter-server",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info("Emitter loop started")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+        logger.info("Emitter server stopped")
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            for emitter in self._emitters:
+                try:
+                    emitter.tick()
+                except Exception as e:
+                    logger.error(
+                        f"Emitter tick failed for {emitter.watch_config.metric}: {e}"
+                    )
+            time.sleep(_EMITTER_TICK_SECONDS)
 
 
 ================================================
 FILE: sentinel/ingestor/__init__.py
 ================================================
-[Empty file]
+# sentinel/ingestor/__init__.py
+
+from sentinel.ingestor.scraper import PrometheusScraper
+from sentinel.ingestor.buffer import MetricBuffer, BufferRegistry
+from sentinel.ingestor.features import (
+    build_lag_features,
+    build_feature_matrix,
+    build_prediction_input,
+)
+
+__all__ = [
+    "PrometheusScraper",
+    "MetricBuffer",
+    "BufferRegistry",
+    "build_lag_features",
+    "build_feature_matrix",
+    "build_prediction_input",
+]
 
 
 ================================================
 FILE: sentinel/ingestor/buffer.py
 ================================================
-[Empty file]
+# sentinel/ingestor/buffer.py
+
+import threading
+import numpy as np
+from collections import deque
+from datetime import datetime, timezone
+from sentinel.utils.logging import get_logger
+from sentinel.utils.time import parse_duration_to_seconds, parse_duration_to_steps
+
+logger = get_logger(__name__)
+
+
+class MetricBuffer:
+    """
+    Sliding window buffer for a single metric+labelset.
+    Holds (timestamp, value) pairs up to the configured lookback window.
+    Thread-safe â€” ingestor writes, trainer and drift monitor read concurrently.
+
+    The buffer is the single source of truth for raw metric history inside Sentinel.
+    Training, feature engineering, and drift detection all read from here.
+    """
+
+    def __init__(self, metric: str, lookback: str, granularity: str):
+        """
+        metric      : metric name, used for logging only
+        lookback    : maximum duration to retain e.g. "30m"
+        granularity : expected resolution of incoming data e.g. "1m"
+        """
+        self.metric = metric
+        self.lookback = lookback
+        self.granularity = granularity
+
+        self._lookback_secs = parse_duration_to_seconds(lookback)
+        self._max_steps = parse_duration_to_steps(lookback, granularity)
+
+        # deque with maxlen automatically evicts oldest entries
+        self._data: deque[tuple[float, float]] = deque(maxlen=self._max_steps)
+        self._lock = threading.RLock()
+
+    def push(self, timestamp: float, value: float) -> None:
+        """
+        Append a single (timestamp, value) pair.
+        Oldest entries are evicted automatically once maxlen is reached.
+        """
+        with self._lock:
+            self._data.append((timestamp, value))
+
+    def push_many(self, samples: list[tuple[float, float]]) -> None:
+        """
+        Append a batch of (timestamp, value) pairs in order.
+        Used during cold start when pulling historical range from Prometheus.
+        """
+        with self._lock:
+            for ts, val in samples:
+                self._data.append((ts, val))
+        logger.debug(f"[{self.metric}] buffer loaded {len(samples)} samples")
+
+    def get_values(self) -> np.ndarray:
+        """
+        Returns a numpy array of values in chronological order.
+        """
+        with self._lock:
+            return np.array([v for _, v in self._data], dtype=float)
+
+    def get_timestamps(self) -> np.ndarray:
+        """
+        Returns a numpy array of unix timestamps in chronological order.
+        """
+        with self._lock:
+            return np.array([ts for ts, _ in self._data], dtype=float)
+
+    def get_samples(self) -> list[tuple[float, float]]:
+        """
+        Returns all (timestamp, value) pairs as a list.
+        """
+        with self._lock:
+            return list(self._data)
+
+    def get_recent(self, n: int) -> np.ndarray:
+        """
+        Returns the n most recent values.
+        If fewer than n values exist, returns all available.
+        """
+        with self._lock:
+            data = list(self._data)
+        recent = data[-n:] if len(data) >= n else data
+        return np.array([v for _, v in recent], dtype=float)
+
+    def is_ready(self) -> bool:
+        """
+        Returns True if the buffer has accumulated enough data
+        to fill the full lookback window.
+        Trainer checks this before triggering cold start training.
+        """
+        with self._lock:
+            return len(self._data) >= self._max_steps
+
+    def current_size(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def capacity(self) -> int:
+        return self._max_steps
+
+    def fill_fraction(self) -> float:
+        """
+        Returns how full the buffer is as a fraction between 0.0 and 1.0.
+        Useful for logging cold start progress.
+        """
+        with self._lock:
+            return len(self._data) / self._max_steps
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+        logger.debug(f"[{self.metric}] buffer cleared")
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def __repr__(self) -> str:
+        return (
+            f"MetricBuffer(metric={self.metric}, "
+            f"size={self.current_size()}/{self.capacity()}, "
+            f"lookback={self.lookback}, "
+            f"granularity={self.granularity})"
+        )
+
+
+class BufferRegistry:
+    """
+    Holds one MetricBuffer per watched metric.
+    Core.py creates this once and passes it to both the ingestor and pipeline.
+    """
+
+    def __init__(self):
+        self._buffers: dict[str, MetricBuffer] = {}
+        self._lock = threading.Lock()
+
+    def register(
+        self,
+        key: str,
+        metric: str,
+        lookback: str,
+        granularity: str,
+    ) -> MetricBuffer:
+        """
+        Register a new buffer for a metric.
+        key is typically metric_name + label fingerprint.
+        Returns the created buffer.
+        """
+        with self._lock:
+            if key in self._buffers:
+                logger.warning(f"Buffer already registered for key '{key}', returning existing.")
+                return self._buffers[key]
+            buf = MetricBuffer(metric=metric, lookback=lookback, granularity=granularity)
+            self._buffers[key] = buf
+            logger.debug(f"Registered buffer for key '{key}'")
+            return buf
+
+    def get(self, key: str) -> MetricBuffer | None:
+        with self._lock:
+            return self._buffers.get(key)
+
+    def all_ready(self) -> bool:
+        """
+        Returns True only if every registered buffer has reached capacity.
+        Used by scheduler to gate cold start training.
+        """
+        with self._lock:
+            return all(buf.is_ready() for buf in self._buffers.values())
+
+    def keys(self) -> list[str]:
+        with self._lock:
+            return list(self._buffers.keys())
+
+    def __repr__(self) -> str:
+        with self._lock:
+            summaries = ", ".join(
+                f"{k}({buf.fill_fraction():.0%})"
+                for k, buf in self._buffers.items()
+            )
+        return f"BufferRegistry([{summaries}])"
 
 
 ================================================
 FILE: sentinel/ingestor/features.py
 ================================================
-[Empty file]
+# sentinel/ingestor/features.py
+
+import numpy as np
+from sentinel.utils.time import parse_duration_to_steps
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def build_lag_features(
+    values: np.ndarray,
+    n_lags: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a supervised learning dataset from a univariate time series
+    using lag features.
+
+    Given a series [v0, v1, v2, ..., vN], for n_lags=3 this produces:
+
+        X (features):           y (targets):
+        [v0, v1, v2]         ->  v3
+        [v1, v2, v3]         ->  v4
+        ...
+        [vN-3, vN-2, vN-1]  ->  vN
+
+    X shape: (n_samples, n_lags)
+    y shape: (n_samples,)
+
+    n_samples = len(values) - n_lags
+    """
+    if len(values) <= n_lags:
+        raise ValueError(
+            f"Not enough values to build lag features. "
+            f"Need more than {n_lags} values, got {len(values)}."
+        )
+
+    X = np.array([values[i:i + n_lags] for i in range(len(values) - n_lags)])
+    y = values[n_lags:]
+
+    return X, y
+
+
+def build_feature_matrix(
+    values: np.ndarray,
+    lookback: str,
+    granularity: str,
+    include_rolling_mean: bool = True,
+    include_rolling_std: bool = True,
+    include_time_features: bool = True,
+    timestamps: np.ndarray = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Full feature engineering pipeline. Builds lag features and optionally
+    appends rolling statistics and time-based features.
+
+    values       : raw metric values in chronological order
+    lookback     : lookback window e.g. "30m"
+    granularity  : resolution e.g. "1m"
+    timestamps   : unix timestamps aligned with values, required if
+                   include_time_features=True
+
+    Returns (X, y) where X has shape (n_samples, n_features).
+    """
+    n_lags = parse_duration_to_steps(lookback, granularity)
+    X_lag, y = build_lag_features(values, n_lags)
+
+    feature_blocks = [X_lag]
+
+    if include_rolling_mean:
+        rolling_mean = _rolling_mean(values, window=n_lags)
+        # align to X rows â€” rolling mean is computed up to each sample's last lag
+        rolling_mean_aligned = rolling_mean[n_lags:]
+        feature_blocks.append(rolling_mean_aligned.reshape(-1, 1))
+
+    if include_rolling_std:
+        rolling_std = _rolling_std(values, window=n_lags)
+        rolling_std_aligned = rolling_std[n_lags:]
+        feature_blocks.append(rolling_std_aligned.reshape(-1, 1))
+
+    if include_time_features and timestamps is not None:
+        time_feats = _time_features(timestamps[n_lags:])
+        feature_blocks.append(time_feats)
+    elif include_time_features and timestamps is None:
+        logger.warning(
+            "include_time_features=True but no timestamps provided. "
+            "Skipping time features."
+        )
+
+    X = np.hstack(feature_blocks)
+
+    return X, y
+
+
+def build_prediction_input(
+    values: np.ndarray,
+    lookback: str,
+    granularity: str,
+    include_rolling_mean: bool = True,
+    include_rolling_std: bool = True,
+    include_time_features: bool = True,
+    timestamps: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Build the feature vector for the most recent observation.
+    This is the input passed to model.predict() at inference time.
+
+    Returns X with shape (1, n_features).
+    """
+    n_lags = parse_duration_to_steps(lookback, granularity)
+
+    if len(values) < n_lags:
+        raise ValueError(
+            f"Need at least {n_lags} values to build prediction input, "
+            f"got {len(values)}."
+        )
+
+    lag_window = values[-n_lags:].reshape(1, -1)
+    feature_blocks = [lag_window]
+
+    if include_rolling_mean:
+        mean_val = np.mean(values[-n_lags:]).reshape(1, 1)
+        feature_blocks.append(mean_val)
+
+    if include_rolling_std:
+        std_val = np.std(values[-n_lags:]).reshape(1, 1)
+        feature_blocks.append(std_val)
+
+    if include_time_features and timestamps is not None:
+        latest_ts = timestamps[-1:]
+        time_feats = _time_features(latest_ts)
+        feature_blocks.append(time_feats)
+
+    return np.hstack(feature_blocks)
+
+
+def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
+    """
+    Compute rolling mean with the given window size.
+    First (window-1) values are filled with the expanding mean.
+    """
+    result = np.empty(len(values))
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        result[i] = np.mean(values[start:i + 1])
+    return result
+
+
+def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:
+    """
+    Compute rolling standard deviation with the given window size.
+    First (window-1) values are filled with the expanding std.
+    """
+    result = np.empty(len(values))
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        chunk = values[start:i + 1]
+        result[i] = np.std(chunk) if len(chunk) > 1 else 0.0
+    return result
+
+
+def _time_features(timestamps: np.ndarray) -> np.ndarray:
+    """
+    Extract cyclical time features from unix timestamps.
+    Encodes hour-of-day and day-of-week as sine/cosine pairs
+    so the model sees time as continuous rather than categorical.
+
+    Returns array of shape (n, 4):
+        col 0: sin(hour_of_day)
+        col 1: cos(hour_of_day)
+        col 2: sin(day_of_week)
+        col 3: cos(day_of_week)
+    """
+    hours = (timestamps % 86400) / 3600          # 0..23
+    days = (timestamps // 86400) % 7             # 0..6
+
+    hour_sin = np.sin(2 * np.pi * hours / 24)
+    hour_cos = np.cos(2 * np.pi * hours / 24)
+    day_sin = np.sin(2 * np.pi * days / 7)
+    day_cos = np.cos(2 * np.pi * days / 7)
+
+    return np.stack([hour_sin, hour_cos, day_sin, day_cos], axis=1)
 
 
 ================================================
 FILE: sentinel/ingestor/scraper.py
 ================================================
-[Empty file]
+# sentinel/ingestor/scraper.py
+
+import time
+import httpx
+from datetime import datetime, timezone
+from sentinel.utils.logging import get_logger
+from sentinel.utils.time import (
+    parse_duration_to_seconds,
+    align_timestamp_to_granularity,
+)
+
+logger = get_logger(__name__)
+
+
+class PrometheusScraper:
+    """
+    Pulls time series data from Prometheus HTTP API.
+    One scraper instance is shared across all watched metrics.
+    Uses httpx for sync HTTP â€” keeps it simple, no async complexity
+    since scraping runs in its own background thread.
+    """
+
+    def __init__(self, prometheus_url: str, timeout: int = 10):
+        self.prometheus_url = prometheus_url.rstrip("/")
+        self.timeout = timeout
+        self._client = httpx.Client(timeout=self.timeout)
+
+    def fetch_range(
+        self,
+        metric: str,
+        labels: dict[str, str],
+        start: datetime,
+        end: datetime,
+        granularity: str,
+    ) -> list[tuple[float, float]]:
+        """
+        Fetch a range of samples for a metric+label set from Prometheus.
+
+        Returns a list of (unix_timestamp, value) tuples sorted ascending.
+        Empty list if no data found.
+
+        metric      : metric name e.g. "http_request_duration_seconds"
+        labels      : label filters e.g. {"job": "api", "status": "200"}
+        start       : range start datetime (UTC)
+        end         : range end datetime (UTC)
+        granularity : step size e.g. "1m"
+        """
+        query = self._build_selector(metric, labels)
+        step = granularity  # Prometheus accepts e.g. "1m", "30s" directly
+
+        params = {
+            "query": query,
+            "start": start.timestamp(),
+            "end": end.timestamp(),
+            "step": step,
+        }
+
+        url = f"{self.prometheus_url}/api/v1/query_range"
+
+        try:
+            response = self._client.get(url, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Prometheus returned HTTP {e.response.status_code} "
+                f"for query '{query}': {e.response.text}"
+            )
+            return []
+        except httpx.RequestError as e:
+            logger.error(f"Failed to reach Prometheus at {url}: {e}")
+            return []
+
+        data = response.json()
+
+        if data.get("status") != "success":
+            logger.warning(
+                f"Prometheus query returned non-success status for '{query}': {data}"
+            )
+            return []
+
+        results = data.get("data", {}).get("result", [])
+
+        if not results:
+            logger.debug(f"No data returned from Prometheus for query '{query}'")
+            return []
+
+        # take the first matching series
+        # one model per metric+labelset so there should only be one
+        values = results[0].get("values", [])
+
+        return [(float(ts), float(val)) for ts, val in values]
+
+    def fetch_latest(
+        self,
+        metric: str,
+        labels: dict[str, str],
+    ) -> tuple[float, float] | None:
+        """
+        Fetch the single most recent sample for a metric+label set.
+        Used by the drift monitor and emitter to get current value.
+
+        Returns (unix_timestamp, value) or None if no data.
+        """
+        query = self._build_selector(metric, labels)
+        url = f"{self.prometheus_url}/api/v1/query"
+        params = {
+            "query": query,
+            "time": datetime.now(timezone.utc).timestamp(),
+        }
+
+        try:
+            response = self._client.get(url, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Prometheus returned HTTP {e.response.status_code} "
+                f"for instant query '{query}': {e.response.text}"
+            )
+            return None
+        except httpx.RequestError as e:
+            logger.error(f"Failed to reach Prometheus at {url}: {e}")
+            return None
+
+        data = response.json()
+
+        if data.get("status") != "success":
+            return None
+
+        results = data.get("data", {}).get("result", [])
+
+        if not results:
+            return None
+
+        ts, val = results[0].get("value", [None, None])
+
+        if ts is None or val is None:
+            return None
+
+        return (float(ts), float(val))
+
+    def check_connectivity(self) -> bool:
+        """
+        Ping Prometheus /-/healthy endpoint.
+        Used at startup to fail fast if Prometheus is unreachable.
+        """
+        url = f"{self.prometheus_url}/-/healthy"
+        try:
+            response = self._client.get(url)
+            return response.status_code == 200
+        except httpx.RequestError:
+            return False
+
+    def close(self) -> None:
+        self._client.close()
+
+    def _build_selector(self, metric: str, labels: dict[str, str]) -> str:
+        """
+        Build a Prometheus instant vector selector string.
+
+        Examples:
+            "http_requests_total"
+            'http_requests_total{job="api",status="200"}'
+        """
+        if not labels:
+            return metric
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        return f"{metric}{{{label_str}}}"
 
 
 ================================================
 FILE: sentinel/pipeline/__init__.py
 ================================================
-[Empty file]
+# sentinel/pipeline/__init__.py
+
+from sentinel.pipeline.drift import DriftMonitor, DriftResult, DriftSeverity
+from sentinel.pipeline.versioning import ModelVersion, VersionStore
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.trainer import Trainer
+from sentinel.pipeline.predictor import Predictor
+from sentinel.pipeline.scheduler import MetricScheduler
+
+__all__ = [
+    "DriftMonitor",
+    "DriftResult",
+    "DriftSeverity",
+    "ModelVersion",
+    "VersionStore",
+    "ModelRegistry",
+    "Trainer",
+    "Predictor",
+    "MetricScheduler",
+]
 
 
 ================================================
 FILE: sentinel/pipeline/drift.py
 ================================================
-[Empty file]
+# sentinel/pipeline/drift.py
+
+import threading
+import numpy as np
+from collections import deque
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class DriftSeverity:
+    NONE = "none"
+    LOW = "low"        # finetune
+    HIGH = "high"      # full retrain
+
+
+class DriftResult:
+    def __init__(self, severity: str, mae: float, threshold_finetune: float, threshold_retrain: float):
+        self.severity = severity
+        self.mae = mae
+        self.threshold_finetune = threshold_finetune
+        self.threshold_retrain = threshold_retrain
+
+    def __repr__(self):
+        return (
+            f"DriftResult(severity={self.severity}, mae={self.mae:.4f}, "
+            f"finetune_threshold={self.threshold_finetune}, "
+            f"retrain_threshold={self.threshold_retrain})"
+        )
+
+
+class DriftMonitor:
+    """
+    Rolling MAE drift monitor for a single metric.
+
+    Maintains a sliding window of (predicted, actual) pairs.
+    On each check, computes MAE over the window and classifies
+    drift severity against the configured thresholds.
+
+    Severity rules:
+        mae < finetune_threshold  -> NONE
+        mae >= finetune_threshold -> LOW  (trigger finetune)
+        mae >= retrain_threshold  -> HIGH (trigger full retrain)
+    """
+
+    def __init__(
+        self,
+        metric: str,
+        finetune_threshold: float,
+        retrain_threshold: float,
+        window_size: int = 60,
+    ):
+        """
+        metric              : metric name for logging
+        finetune_threshold  : MAE above this triggers finetune
+        retrain_threshold   : MAE above this triggers full retrain
+        window_size         : number of recent predictions to compute MAE over
+        """
+        self.metric = metric
+        self.finetune_threshold = finetune_threshold
+        self.retrain_threshold = retrain_threshold
+        self.window_size = window_size
+
+        self._residuals: deque[float] = deque(maxlen=window_size)
+        self._lock = threading.Lock()
+
+    def record(self, predicted: float, actual: float) -> None:
+        """
+        Record a single predicted vs actual pair.
+        Called by the emitter each time a new actual value arrives
+        for a timestep that was previously predicted.
+        """
+        with self._lock:
+            self._residuals.append(abs(predicted - actual))
+
+    def record_many(self, predicted: np.ndarray, actual: np.ndarray) -> None:
+        """
+        Record a batch of predicted vs actual pairs.
+        """
+        with self._lock:
+            for p, a in zip(predicted, actual):
+                self._residuals.append(abs(float(p) - float(a)))
+
+    def check(self) -> DriftResult:
+        """
+        Compute current MAE and classify drift severity.
+        Returns DriftResult with severity, current MAE, and thresholds.
+        """
+        with self._lock:
+            if not self._residuals:
+                return DriftResult(
+                    severity=DriftSeverity.NONE,
+                    mae=0.0,
+                    threshold_finetune=self.finetune_threshold,
+                    threshold_retrain=self.retrain_threshold,
+                )
+            mae = float(np.mean(self._residuals))
+
+        if mae >= self.retrain_threshold:
+            severity = DriftSeverity.HIGH
+        elif mae >= self.finetune_threshold:
+            severity = DriftSeverity.LOW
+        else:
+            severity = DriftSeverity.NONE
+
+        logger.debug(f"[{self.metric}] drift check: MAE={mae:.4f} severity={severity}")
+
+        return DriftResult(
+            severity=severity,
+            mae=mae,
+            threshold_finetune=self.finetune_threshold,
+            threshold_retrain=self.retrain_threshold,
+        )
+
+    def current_mae(self) -> float:
+        with self._lock:
+            if not self._residuals:
+                return 0.0
+            return float(np.mean(self._residuals))
+
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._residuals)
+
+    def reset(self) -> None:
+        """
+        Clear residual history. Called after a successful retrain
+        so the new model starts with a clean drift slate.
+        """
+        with self._lock:
+            self._residuals.clear()
+        logger.debug(f"[{self.metric}] drift monitor reset")
+
+    def __repr__(self) -> str:
+        return (
+            f"DriftMonitor(metric={self.metric}, "
+            f"mae={self.current_mae():.4f}, "
+            f"samples={self.sample_count()}/{self.window_size})"
+        )
 
 
 ================================================
 FILE: sentinel/pipeline/predictor.py
 ================================================
-[Empty file]
+# sentinel/pipeline/predictor.py
+
+import numpy as np
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.models.base import PredictionResult
+from sentinel.ingestor.buffer import MetricBuffer
+from sentinel.ingestor.features import build_prediction_input
+from sentinel.config import WatchConfig
+from sentinel.utils.time import parse_duration_to_seconds
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class Predictor:
+    """
+    Runs inference for a single metric using the currently active model.
+
+    Called on every emitter tick. Reads the latest window from the buffer,
+    builds the prediction input, runs model.predict(), and returns a
+    PredictionResult with absolute timestamps attached.
+
+    Returns None if the model is not ready yet (cold start).
+    """
+
+    def __init__(
+        self,
+        watch_config: WatchConfig,
+        buffer: MetricBuffer,
+        registry: ModelRegistry,
+    ):
+        self.watch_config = watch_config
+        self.buffer = buffer
+        self.registry = registry
+
+    def predict(self) -> Optional[PredictionResult]:
+        """
+        Run inference and return a PredictionResult with absolute timestamps.
+        Returns None if the model is not ready or the buffer is insufficient.
+        """
+        if not self.registry.is_ready():
+            logger.debug(f"[{self._metric_key()}] model not ready, skipping prediction")
+            return None
+
+        values = self.buffer.get_values()
+        timestamps = self.buffer.get_timestamps()
+
+        n_lags = self._n_lags()
+
+        if len(values) < n_lags:
+            logger.debug(
+                f"[{self._metric_key()}] buffer has {len(values)} values, "
+                f"need {n_lags} for prediction input"
+            )
+            return None
+
+        try:
+            X = build_prediction_input(
+                values=values,
+                lookback=self.watch_config.lookback,
+                granularity=self.watch_config.granularity,
+                timestamps=timestamps,
+            )
+        except ValueError as e:
+            logger.error(f"[{self._metric_key()}] failed to build prediction input: {e}")
+            return None
+
+        model = self.registry.get_model()
+
+        try:
+            result = model.predict(X)
+        except Exception as e:
+            logger.error(f"[{self._metric_key()}] model.predict() failed: {e}")
+            return None
+
+        # attach absolute unix timestamps to each prediction step
+        result.timestamps = self._build_timestamps(len(result.values))
+
+        # attach active version id
+        active = self.registry.active_version()
+        if active:
+            result.model_version = active.version_id
+
+        return result
+
+    def _build_timestamps(self, n_steps: int) -> np.ndarray:
+        """
+        Build absolute unix timestamps for each prediction step.
+        Steps are offset from now by granularity increments.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        granularity_secs = parse_duration_to_seconds(self.watch_config.granularity)
+        return np.array([
+            now + (i + 1) * granularity_secs
+            for i in range(n_steps)
+        ])
+
+    def _n_lags(self) -> int:
+        from sentinel.utils.time import parse_duration_to_steps
+        return parse_duration_to_steps(
+            self.watch_config.lookback,
+            self.watch_config.granularity,
+        )
+
+    def _metric_key(self) -> str:
+        cfg = self.watch_config
+        if not cfg.labels:
+            return cfg.metric
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(cfg.labels.items()))
+        return f"{cfg.metric}{{{label_str}}}"
 
 
 ================================================
 FILE: sentinel/pipeline/registry.py
 ================================================
-[Empty file]
+# sentinel/pipeline/registry.py
+
+import threading
+from typing import Optional
+from sentinel.pipeline.models.base import BaseModel
+from sentinel.pipeline.versioning import VersionStore, ModelVersion
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class ModelRegistry:
+    """
+    Holds the live model reference for a single metric key.
+    Handles atomic model swaps on promotion and rollback.
+
+    Works with VersionStore for persistence and metadata.
+    The registry owns the in-memory model object.
+    VersionStore owns the on-disk metadata and artifacts.
+    """
+
+    def __init__(self, metric_key: str, version_store: VersionStore):
+        self.metric_key = metric_key
+        self.version_store = version_store
+
+        self._model: Optional[BaseModel] = None
+        self._active_version: Optional[ModelVersion] = None
+        self._lock = threading.RLock()
+
+    def get_model(self) -> Optional[BaseModel]:
+        """
+        Returns the currently active model instance.
+        Returns None if no model has been promoted yet (cold start).
+        """
+        with self._lock:
+            return self._model
+
+    def promote(self, model: BaseModel, version: ModelVersion) -> None:
+        """
+        Atomically swap in a newly trained model.
+        Saves the artifact, updates version store, and replaces
+        the in-memory model reference in a single lock acquisition.
+
+        Called by trainer.py after successful training + validation.
+        """
+        artifact_path = self.version_store.artifact_path_for(version.version_id)
+        model.save(artifact_path)
+        version.artifact_path = artifact_path
+
+        with self._lock:
+            self.version_store.register(version)
+            self.version_store.promote(version.version_id)
+            self._model = model
+            self._active_version = version
+
+        logger.info(
+            f"[{self.metric_key}] promoted model version {version.version_id} "
+            f"mae={version.mae:.4f}"
+        )
+
+    def rollback(self) -> bool:
+        """
+        Roll back to the previous stable version.
+        Loads the previous model artifact from disk and swaps it in atomically.
+        Returns True if rollback succeeded, False if no previous version exists.
+        """
+        previous = self.version_store.rollback()
+
+        if previous is None:
+            logger.warning(f"[{self.metric_key}] rollback failed â€” no previous version available")
+            return False
+
+        # reconstruct model instance from artifact
+        model = self._load_model_from_version(previous)
+        if model is None:
+            return False
+
+        with self._lock:
+            self._model = model
+            self._active_version = previous
+
+        logger.info(f"[{self.metric_key}] rollback complete â€” now serving {previous.version_id}")
+        return True
+
+    def restore_from_disk(self, model_factory) -> bool:
+        """
+        On Sentinel startup, check if an active version exists on disk
+        and restore it into memory so predictions resume without retraining.
+
+        model_factory: callable that returns a new unfitted BaseModel instance
+                       e.g. lambda: ExponentialSmoothingModel("1m", "5m", "30m")
+        """
+        active = self.version_store.get_active()
+
+        if active is None:
+            logger.info(f"[{self.metric_key}] no persisted model found, cold start required")
+            return False
+
+        model = model_factory()
+        try:
+            model.load(active.artifact_path)
+        except Exception as e:
+            logger.error(
+                f"[{self.metric_key}] failed to load model from {active.artifact_path}: {e}"
+            )
+            return False
+
+        with self._lock:
+            self._model = model
+            self._active_version = active
+
+        logger.info(
+            f"[{self.metric_key}] restored model version {active.version_id} from disk"
+        )
+        return True
+
+    def active_version(self) -> Optional[ModelVersion]:
+        with self._lock:
+            return self._active_version
+
+    def is_ready(self) -> bool:
+        """
+        Returns True if a fitted model is available for inference.
+        """
+        with self._lock:
+            return self._model is not None and self._model.is_fitted
+
+    def _load_model_from_version(self, version: ModelVersion) -> Optional[BaseModel]:
+        """
+        Reconstruct a model instance from a version record.
+        Uses the model_class name stored in the version metadata
+        to import and instantiate the correct class.
+        """
+        import importlib
+        import sentinel.pipeline.models as models_module
+
+        model_class = getattr(models_module, version.model_class, None)
+        if model_class is None:
+            logger.error(
+                f"[{self.metric_key}] unknown model class '{version.model_class}' "
+                f"in version {version.version_id}"
+            )
+            return None
+
+        extra = version.extra or {}
+        granularity = extra.get("granularity", "1m")
+        horizon = extra.get("horizon", "5m")
+        lookback = extra.get("lookback", "30m")
+
+        model = model_class(granularity=granularity, horizon=horizon, lookback=lookback)
+        try:
+            model.load(version.artifact_path)
+        except Exception as e:
+            logger.error(
+                f"[{self.metric_key}] failed to load artifact "
+                f"{version.artifact_path}: {e}"
+            )
+            return None
+
+        return model
+
+    def __repr__(self) -> str:
+        v = self._active_version
+        return (
+            f"ModelRegistry(metric={self.metric_key}, "
+            f"ready={self.is_ready()}, "
+            f"version={v.version_id if v else None})"
+        )
 
 
 ================================================
 FILE: sentinel/pipeline/scheduler.py
 ================================================
-[Empty file]
+# sentinel/pipeline/scheduler.py
+
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Callable
+from sentinel.pipeline.drift import DriftMonitor, DriftSeverity
+from sentinel.ingestor.buffer import MetricBuffer
+from sentinel.config import WatchConfig
+from sentinel.utils.cron import seconds_until_next_fire
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# how often the scheduler wakes up to check cron and drift
+_TICK_INTERVAL_SECONDS = 10
+
+
+class MetricScheduler:
+    """
+    Manages the training schedule for a single metric.
+
+    Two triggers:
+        1. Cron â€” fires on the configured cron schedule
+        2. Drift â€” fires when DriftMonitor reports LOW or HIGH severity
+
+    On each trigger, calls the provided train_fn with the appropriate
+    drift severity so Trainer knows which policy to apply.
+
+    Runs in a dedicated daemon thread per metric.
+    """
+
+    def __init__(
+        self,
+        watch_config: WatchConfig,
+        buffer: MetricBuffer,
+        drift_monitor: DriftMonitor,
+        train_fn: Callable[[str, float], None],
+    ):
+        """
+        watch_config  : config for this metric
+        buffer        : buffer to check readiness before training
+        drift_monitor : drift monitor to poll for severity
+        train_fn      : callable(drift_severity, drift_score) -> None
+                        provided by core.py, calls Trainer.run()
+        """
+        self.watch_config = watch_config
+        self.buffer = buffer
+        self.drift_monitor = drift_monitor
+        self.train_fn = train_fn
+
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread = None
+        self._last_cron_fire: datetime = None
+        self._cold_start_done: bool = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"scheduler-{self.watch_config.metric}",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(f"[{self._metric_key()}] scheduler started cron='{self.watch_config.cron}'")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        logger.info(f"[{self._metric_key()}] scheduler stopped")
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                logger.error(f"[{self._metric_key()}] scheduler tick error: {e}")
+            time.sleep(_TICK_INTERVAL_SECONDS)
+
+    def _tick(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        # gate everything on buffer readiness
+        if not self.buffer.is_ready():
+            pct = self.buffer.fill_fraction() * 100
+            logger.debug(f"[{self._metric_key()}] buffer {pct:.0f}% full, waiting for cold start window")
+            return
+
+        # cold start â€” first training run once buffer is full
+        if not self._cold_start_done:
+            logger.info(f"[{self._metric_key()}] buffer ready, triggering cold start training")
+            self._fire(DriftSeverity.NONE, 0.0)
+            self._cold_start_done = True
+            self._last_cron_fire = now
+            return
+
+        # drift check â€” higher priority than cron
+        drift_result = self.drift_monitor.check()
+        if drift_result.severity != DriftSeverity.NONE:
+            logger.info(
+                f"[{self._metric_key()}] drift detected severity={drift_result.severity} "
+                f"mae={drift_result.mae:.4f}, triggering retrain"
+            )
+            self._fire(drift_result.severity, drift_result.mae)
+            self.drift_monitor.reset()
+            self._last_cron_fire = now
+            return
+
+        # cron check
+        if self._cron_due(now):
+            logger.info(f"[{self._metric_key()}] cron fired, triggering scheduled retrain")
+            self._fire(DriftSeverity.NONE, 0.0)
+            self._last_cron_fire = now
+
+    def _fire(self, severity: str, drift_score: float) -> None:
+        """
+        Dispatch training job in a separate thread so the scheduler
+        loop is never blocked by a long training run.
+        """
+        t = threading.Thread(
+            target=self.train_fn,
+            args=(severity, drift_score),
+            name=f"trainer-{self.watch_config.metric}",
+            daemon=True,
+        )
+        t.start()
+
+    def _cron_due(self, now: datetime) -> bool:
+        """
+        Returns True if the cron schedule has fired since the last
+        recorded fire time.
+        """
+        if self._last_cron_fire is None:
+            return False
+        try:
+            secs = seconds_until_next_fire(self.watch_config.cron, base=self._last_cron_fire)
+            elapsed = (now - self._last_cron_fire).total_seconds()
+            return elapsed >= secs
+        except Exception as e:
+            logger.error(f"[{self._metric_key()}] cron check failed: {e}")
+            return False
+
+    def _metric_key(self) -> str:
+        cfg = self.watch_config
+        if not cfg.labels:
+            return cfg.metric
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(cfg.labels.items()))
+        return f"{cfg.metric}{{{label_str}}}"
 
 
 ================================================
 FILE: sentinel/pipeline/trainer.py
 ================================================
-[Empty file]
+# sentinel/pipeline/trainer.py
+
+import threading
+from datetime import datetime, timezone
+from typing import Optional
+from sentinel.pipeline.models.base import BaseModel, TrainingResult
+from sentinel.pipeline.versioning import ModelVersion, VersionStore
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.drift import DriftSeverity
+from sentinel.ingestor.buffer import MetricBuffer
+from sentinel.ingestor.features import build_feature_matrix
+from sentinel.config import WatchConfig
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# fraction of buffer to hold out for validation
+_HOLDOUT_FRACTION = 0.1
+
+
+class Trainer:
+    """
+    Orchestrates training and finetuning for a single metric.
+
+    On each training run:
+        1. Pulls data from the MetricBuffer
+        2. Builds feature matrix via features.py
+        3. Splits into train/holdout
+        4. Calls fit() or partial_fit() based on drift severity
+        5. Validates on holdout
+        6. Promotes new model via ModelRegistry if validation passes
+        7. Resets drift monitor after successful promotion
+    """
+
+    def __init__(
+        self,
+        watch_config: WatchConfig,
+        buffer: MetricBuffer,
+        registry: ModelRegistry,
+    ):
+        self.watch_config = watch_config
+        self.buffer = buffer
+        self.registry = registry
+        self._lock = threading.Lock()
+
+    def run(
+        self,
+        drift_severity: str = DriftSeverity.NONE,
+        drift_score: float = 0.0,
+    ) -> Optional[TrainingResult]:
+        """
+        Execute a training run. Thread-safe â€” scheduler calls this
+        from a background thread.
+
+        drift_severity : determines whether to fit() or partial_fit()
+        drift_score    : MAE at the time of the trigger, logged in version metadata
+
+        Returns TrainingResult on success, None on failure.
+        """
+        with self._lock:
+            return self._run_internal(drift_severity, drift_score)
+
+    def _run_internal(
+        self,
+        drift_severity: str,
+        drift_score: float,
+    ) -> Optional[TrainingResult]:
+
+        metric_key = self._metric_key()
+        logger.info(
+            f"[{metric_key}] training run started "
+            f"severity={drift_severity} drift_score={drift_score:.4f}"
+        )
+
+        values = self.buffer.get_values()
+        timestamps = self.buffer.get_timestamps()
+
+        if len(values) < 2:
+            logger.warning(f"[{metric_key}] not enough data to train, skipping")
+            return None
+
+        # build feature matrix
+        try:
+            X, y = build_feature_matrix(
+                values=values,
+                lookback=self.watch_config.lookback,
+                granularity=self.watch_config.granularity,
+                timestamps=timestamps,
+            )
+        except ValueError as e:
+            logger.error(f"[{metric_key}] feature build failed: {e}")
+            return None
+
+        if len(X) < 4:
+            logger.warning(f"[{metric_key}] too few samples after feature build ({len(X)}), skipping")
+            return None
+
+        # train/holdout split
+        split = max(1, int(len(X) * (1 - _HOLDOUT_FRACTION)))
+        X_train, y_train = X[:split], y[:split]
+        X_val, y_val = X[split:], y[split:]
+
+        # instantiate or reuse model
+        current_model = self.registry.get_model()
+        policy = self._determine_policy(drift_severity, current_model)
+
+        model = self._get_or_create_model()
+
+        try:
+            if policy == "full_retrain" or not model.is_fitted:
+                result = model.fit(X_train, y_train)
+                result.training_policy = "full_retrain"
+            else:
+                result = model.partial_fit(X_train, y_train)
+                result.training_policy = "finetune"
+        except Exception as e:
+            logger.error(f"[{metric_key}] model training failed: {e}")
+            return None
+
+        # validate on holdout
+        if len(X_val) > 0:
+            val_result = self._validate(model, X_val, y_val)
+            if val_result is None:
+                logger.warning(f"[{metric_key}] validation failed, not promoting model")
+                return None
+            result.mae = val_result["mae"]
+            result.mape = val_result["mape"]
+
+        # build version record
+        version_id = self.registry.version_store.next_version_id()
+        version = ModelVersion(
+            version_id=version_id,
+            metric_key=metric_key,
+            model_class=type(model).__name__,
+            trained_at=datetime.now(timezone.utc).isoformat(),
+            training_policy=result.training_policy,
+            drift_score_at_trigger=drift_score,
+            mae=result.mae,
+            mape=result.mape,
+            n_samples=result.n_samples,
+            artifact_path="",  # set by registry.promote()
+            extra={
+                "granularity": self.watch_config.granularity,
+                "horizon": self.watch_config.horizon,
+                "lookback": self.watch_config.lookback,
+            }
+        )
+
+        self.registry.promote(model, version)
+
+        logger.info(
+            f"[{metric_key}] training complete â€” version={version_id} "
+            f"policy={result.training_policy} mae={result.mae:.4f} mape={result.mape:.2f}%"
+        )
+
+        return result
+
+    def _validate(self, model: BaseModel, X_val: "np.ndarray", y_val: "np.ndarray") -> Optional[dict]:
+        import numpy as np
+        try:
+            pred_result = model.predict(X_val[0:1])
+            # for validation we do single-step ahead comparison only
+            y_pred = np.array([
+                float(model.predict(X_val[i:i + 1]).values[0])
+                for i in range(len(X_val))
+            ])
+            mae = float(np.mean(np.abs(y_val - y_pred)))
+            mape = float(np.mean(np.abs((y_val - y_pred) / (y_val + 1e-8)))) * 100
+            return {"mae": mae, "mape": mape}
+        except Exception as e:
+            logger.error(f"Validation error: {e}")
+            return None
+
+    def _get_or_create_model(self) -> BaseModel:
+        """
+        For full retrain, always create a fresh model instance.
+        For finetune, return the existing model from registry.
+        """
+        existing = self.registry.get_model()
+        if existing is not None:
+            return existing
+
+        cls = self.watch_config.model_class
+        return cls(
+            granularity=self.watch_config.granularity,
+            horizon=self.watch_config.horizon,
+            lookback=self.watch_config.lookback,
+        )
+
+    def _determine_policy(self, drift_severity: str, current_model: Optional[BaseModel]) -> str:
+        if current_model is None or not current_model.is_fitted:
+            return "full_retrain"
+        if drift_severity == DriftSeverity.HIGH:
+            return "full_retrain"
+        if drift_severity == DriftSeverity.LOW:
+            return "finetune"
+        # cron-scheduled run with no drift â€” do a full retrain to keep fresh
+        return "full_retrain"
+
+    def _metric_key(self) -> str:
+        cfg = self.watch_config
+        if not cfg.labels:
+            return cfg.metric
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(cfg.labels.items()))
+        return f"{cfg.metric}{{{label_str}}}"
 
 
 ================================================
 FILE: sentinel/pipeline/versioning.py
 ================================================
-[Empty file]
+# sentinel/pipeline/versioning.py
+
+import os
+import json
+import threading
+from datetime import datetime, timezone
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+from sentinel.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class ModelVersion:
+    """
+    Metadata record for a single trained model version.
+    Stored as JSON alongside the serialized model artifact.
+    """
+    version_id: str
+    metric_key: str
+    model_class: str
+    trained_at: str                   # ISO8601 UTC
+    training_policy: str              # "full_retrain" or "finetune"
+    drift_score_at_trigger: float
+    mae: float
+    mape: float
+    n_samples: int
+    artifact_path: str
+    status: str = "active"            # "active", "retired", "rolled_back"
+    extra: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelVersion":
+        return cls(**d)
+
+
+class VersionStore:
+    """
+    Manages model version metadata for a single metric key.
+    Persists version records as JSON files in the artifact store.
+    Handles pruning old versions beyond max_versions.
+
+    Directory layout:
+        artifact_store/
+            {metric_key}/
+                versions.json          <- version index
+                v1/
+                    model.joblib
+                v2/
+                    model.joblib
+                ...
+    """
+
+    def __init__(self, metric_key: str, artifact_store: str, max_versions: int = 5):
+        self.metric_key = metric_key
+        self.artifact_store = artifact_store
+        self.max_versions = max_versions
+
+        self._lock = threading.Lock()
+        self._base_dir = os.path.join(artifact_store, self._sanitize_key(metric_key))
+        self._index_path = os.path.join(self._base_dir, "versions.json")
+        self._versions: list[ModelVersion] = []
+
+        os.makedirs(self._base_dir, exist_ok=True)
+        self._load_index()
+
+    def next_version_id(self) -> str:
+        with self._lock:
+            n = len(self._versions) + 1
+            return f"v{n}"
+
+    def artifact_path_for(self, version_id: str) -> str:
+        """
+        Returns the file path where a model artifact for this version should be saved.
+        Creates the directory if it doesn't exist.
+        """
+        version_dir = os.path.join(self._base_dir, version_id)
+        os.makedirs(version_dir, exist_ok=True)
+        return os.path.join(version_dir, "model.joblib")
+
+    def register(self, version: ModelVersion) -> None:
+        """
+        Add a new version to the index and persist.
+        Prunes oldest retired versions if over max_versions.
+        """
+        with self._lock:
+            self._versions.append(version)
+            self._prune()
+            self._save_index()
+        logger.info(
+            f"[{self.metric_key}] registered version {version.version_id} "
+            f"policy={version.training_policy} mae={version.mae:.4f}"
+        )
+
+    def get_active(self) -> Optional[ModelVersion]:
+        """
+        Returns the currently active version, or None if no active version exists.
+        """
+        with self._lock:
+            active = [v for v in self._versions if v.status == "active"]
+            return active[-1] if active else None
+
+    def get_all(self) -> list[ModelVersion]:
+        with self._lock:
+            return list(self._versions)
+
+    def get_by_id(self, version_id: str) -> Optional[ModelVersion]:
+        with self._lock:
+            for v in self._versions:
+                if v.version_id == version_id:
+                    return v
+            return None
+
+    def promote(self, version_id: str) -> None:
+        """
+        Set a version as active, retire all others.
+        Called after successful training + validation.
+        """
+        with self._lock:
+            for v in self._versions:
+                if v.version_id == version_id:
+                    v.status = "active"
+                elif v.status == "active":
+                    v.status = "retired"
+            self._save_index()
+        logger.info(f"[{self.metric_key}] promoted version {version_id} to active")
+
+    def rollback(self) -> Optional[ModelVersion]:
+        """
+        Retire the current active version and restore the most recent
+        previously active (non-rolled-back) version.
+        Returns the restored version, or None if no previous version exists.
+        """
+        with self._lock:
+            active = [v for v in self._versions if v.status == "active"]
+            retired = [v for v in self._versions if v.status == "retired"]
+
+            if not active:
+                logger.warning(f"[{self.metric_key}] rollback called but no active version")
+                return None
+
+            if not retired:
+                logger.warning(f"[{self.metric_key}] rollback called but no retired version to restore")
+                return None
+
+            current = active[-1]
+            current.status = "rolled_back"
+
+            previous = retired[-1]
+            previous.status = "active"
+
+            self._save_index()
+
+        logger.info(
+            f"[{self.metric_key}] rolled back from {current.version_id} "
+            f"to {previous.version_id}"
+        )
+        return previous
+
+    def _prune(self) -> None:
+        """
+        Remove oldest retired versions beyond max_versions.
+        Active and rolled_back versions are never pruned.
+        """
+        retired = [v for v in self._versions if v.status == "retired"]
+        if len(self._versions) <= self.max_versions:
+            return
+
+        to_prune = retired[:len(self._versions) - self.max_versions]
+        for v in to_prune:
+            self._versions.remove(v)
+            artifact = v.artifact_path
+            if os.path.exists(artifact):
+                try:
+                    os.remove(artifact)
+                    version_dir = os.path.dirname(artifact)
+                    if not os.listdir(version_dir):
+                        os.rmdir(version_dir)
+                except OSError as e:
+                    logger.warning(f"[{self.metric_key}] failed to delete artifact {artifact}: {e}")
+            logger.debug(f"[{self.metric_key}] pruned version {v.version_id}")
+
+    def _save_index(self) -> None:
+        data = [v.to_dict() for v in self._versions]
+        with open(self._index_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _load_index(self) -> None:
+        if not os.path.exists(self._index_path):
+            self._versions = []
+            return
+        with open(self._index_path, "r") as f:
+            data = json.load(f)
+        self._versions = [ModelVersion.from_dict(d) for d in data]
+        logger.debug(f"[{self.metric_key}] loaded {len(self._versions)} versions from index")
+
+    @staticmethod
+    def _sanitize_key(key: str) -> str:
+        return key.replace("{", "").replace("}", "").replace(",", "_").replace('"', "").replace("=", "-")
 
 
 ================================================
@@ -595,7 +2716,67 @@ class ARIMAModel(BaseModel):
 ================================================
 FILE: sentinel/pipeline/models/base.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/base.py
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+import numpy as np
+
+
+@dataclass
+class PredictionResult:
+    values: np.ndarray
+    timestamps: np.ndarray
+    lower_bound: Optional[np.ndarray] = None
+    upper_bound: Optional[np.ndarray] = None
+    model_version: Optional[str] = None
+
+
+@dataclass
+class TrainingResult:
+    mae: float
+    mape: float
+    n_samples: int
+    training_policy: str  # "full_retrain" or "finetune"
+    extra: dict = field(default_factory=dict)
+
+
+class BaseModel(ABC):
+
+    def __init__(self, granularity: str, horizon: str, lookback: str):
+        self.granularity = granularity
+        self.horizon = horizon
+        self.lookback = lookback
+        self._is_fitted = False
+
+    @abstractmethod
+    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult: ...
+
+    @abstractmethod
+    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult: ...
+
+    @abstractmethod
+    def predict(self, X: np.ndarray) -> PredictionResult: ...
+
+    @abstractmethod
+    def save(self, path: str) -> None: ...
+
+    @abstractmethod
+    def load(self, path: str) -> None: ...
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._is_fitted
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"granularity={self.granularity}, "
+            f"horizon={self.horizon}, "
+            f"lookback={self.lookback}, "
+            f"fitted={self._is_fitted})"
+        )
 
 
 ================================================
@@ -971,7 +3152,100 @@ FILE: sentinel/utils/logging.py
 ================================================
 FILE: sentinel/utils/time.py
 ================================================
-[Empty file]
+# sentinel/utils/time.py
+
+import re
+from datetime import timedelta
+
+
+# maps unit suffix to seconds
+_UNIT_TO_SECONDS: dict[str, int] = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+
+def parse_duration_to_seconds(duration: str) -> int:
+    """
+    Parse a human-readable duration string into total seconds.
+
+    Examples:
+        "30s" -> 30
+        "5m"  -> 300
+        "1h"  -> 3600
+        "2d"  -> 172800
+    """
+    duration = duration.strip().lower()
+    match = re.fullmatch(r"(\d+)([smhdw])", duration)
+    if not match:
+        raise ValueError(
+            f"Invalid duration format: '{duration}'. "
+            f"Expected a number followed by s, m, h, d, or w. e.g. '5m', '1h', '30s'."
+        )
+    value = int(match.group(1))
+    unit = match.group(2)
+    return value * _UNIT_TO_SECONDS[unit]
+
+
+def parse_duration_to_steps(duration: str, granularity: str) -> int:
+    """
+    Compute how many granularity-sized steps fit in duration.
+
+    Examples:
+        parse_duration_to_steps("30m", "1m")  -> 30
+        parse_duration_to_steps("1h",  "5m")  -> 12
+        parse_duration_to_steps("1h",  "30s") -> 120
+
+    Raises ValueError if duration is not evenly divisible by granularity.
+    """
+    duration_secs = parse_duration_to_seconds(duration)
+    granularity_secs = parse_duration_to_seconds(granularity)
+
+    if granularity_secs == 0:
+        raise ValueError("Granularity must be greater than zero.")
+
+    if duration_secs % granularity_secs != 0:
+        raise ValueError(
+            f"Duration '{duration}' ({duration_secs}s) is not evenly divisible "
+            f"by granularity '{granularity}' ({granularity_secs}s)."
+        )
+
+    return duration_secs // granularity_secs
+
+
+def steps_to_timedeltas(
+    n_steps: int,
+    granularity: str,
+    start_offset_seconds: int = 0,
+) -> list[timedelta]:
+    """
+    Generate a list of timedeltas representing future prediction timestamps.
+
+    start_offset_seconds: offset from now to start at, default 0 (immediate next step).
+
+    Example:
+        steps_to_timedeltas(3, "5m") ->
+            [timedelta(minutes=5), timedelta(minutes=10), timedelta(minutes=15)]
+    """
+    granularity_secs = parse_duration_to_seconds(granularity)
+    return [
+        timedelta(seconds=start_offset_seconds + (i + 1) * granularity_secs)
+        for i in range(n_steps)
+    ]
+
+
+def align_timestamp_to_granularity(timestamp: float, granularity: str) -> float:
+    """
+    Floor a unix timestamp to the nearest granularity boundary.
+
+    Example:
+        align_timestamp_to_granularity(1700000123.0, "5m") -> 1700000100.0
+    """
+    granularity_secs = parse_duration_to_seconds(granularity)
+    return float(int(timestamp) // granularity_secs * granularity_secs)
 
 
 ================================================
