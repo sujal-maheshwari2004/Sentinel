@@ -41,19 +41,23 @@ Directory structure:
     └── tests/
         ├── __init__.py
         ├── test_emitter/
+        │   ├── __init__.py
         │   ├── test_formatter.py
         │   └── test_server.py
         ├── test_ingestor/
+        │   ├── __init__.py
         │   ├── test_buffer.py
         │   ├── test_features.py
         │   └── test_scraper.py
         ├── test_pipeline/
+        │   ├── __init__.py
         │   ├── test_drift.py
         │   ├── test_predictor.py
         │   ├── test_registry.py
         │   ├── test_scheduler.py
         │   └── test_trainer.py
         └── test_utils/
+            ├── __init__.py
             ├── test_cron.py
             └── test_time.py
 
@@ -3134,19 +3138,184 @@ class ExponentialSmoothingModel(BaseModel):
 ================================================
 FILE: sentinel/utils/__init__.py
 ================================================
-[Empty file]
+# sentinel/utils/__init__.py
+
+from sentinel.utils.time import (
+    parse_duration_to_seconds,
+    parse_duration_to_steps,
+    steps_to_timedeltas,
+    align_timestamp_to_granularity,
+)
+from sentinel.utils.cron import (
+    is_valid_cron,
+    get_next_fire_time,
+    get_previous_fire_time,
+    seconds_until_next_fire,
+    seconds_since_last_fire,
+    get_fire_times_between,
+)
+from sentinel.utils.logging import get_logger, configure_logging
+from sentinel.utils.validation import (
+    ConfigValidationError,
+    validate_watch_config,
+    validate_sentinel_config,
+)
+
+__all__ = [
+    "parse_duration_to_seconds",
+    "parse_duration_to_steps",
+    "steps_to_timedeltas",
+    "align_timestamp_to_granularity",
+    "is_valid_cron",
+    "get_next_fire_time",
+    "get_previous_fire_time",
+    "seconds_until_next_fire",
+    "seconds_since_last_fire",
+    "get_fire_times_between",
+    "get_logger",
+    "configure_logging",
+    "ConfigValidationError",
+    "validate_watch_config",
+    "validate_sentinel_config",
+]
 
 
 ================================================
 FILE: sentinel/utils/cron.py
 ================================================
-[Empty file]
+# sentinel/utils/cron.py
+
+from croniter import croniter
+from datetime import datetime, timezone
+
+
+def is_valid_cron(cron_string: str) -> bool:
+    """
+    Returns True if the cron string is valid, False otherwise.
+    """
+    return croniter.is_valid(cron_string)
+
+
+def get_next_fire_time(cron_string: str, base: datetime = None) -> datetime:
+    """
+    Get the next datetime this cron expression will fire.
+
+    base: datetime to compute from, defaults to now UTC.
+    """
+    if not is_valid_cron(cron_string):
+        raise ValueError(f"Invalid cron string: '{cron_string}'")
+
+    base = base or datetime.now(timezone.utc)
+    cron = croniter(cron_string, base)
+    return cron.get_next(datetime)
+
+
+def get_previous_fire_time(cron_string: str, base: datetime = None) -> datetime:
+    """
+    Get the most recent datetime this cron expression fired before base.
+
+    Useful for computing the cold start window â€” how long ago did the
+    last scheduled training run happen?
+    """
+    if not is_valid_cron(cron_string):
+        raise ValueError(f"Invalid cron string: '{cron_string}'")
+
+    base = base or datetime.now(timezone.utc)
+    cron = croniter(cron_string, base)
+    return cron.get_prev(datetime)
+
+
+def seconds_until_next_fire(cron_string: str, base: datetime = None) -> float:
+    """
+    Returns how many seconds until the next cron fire time.
+    """
+    base = base or datetime.now(timezone.utc)
+    next_fire = get_next_fire_time(cron_string, base)
+    return (next_fire - base).total_seconds()
+
+
+def seconds_since_last_fire(cron_string: str, base: datetime = None) -> float:
+    """
+    Returns how many seconds have elapsed since the last cron fire time.
+    Used by the scheduler to determine if cold start window has elapsed.
+    """
+    base = base or datetime.now(timezone.utc)
+    prev_fire = get_previous_fire_time(cron_string, base)
+    return (base - prev_fire).total_seconds()
+
+
+def get_fire_times_between(
+    cron_string: str,
+    start: datetime,
+    end: datetime,
+) -> list[datetime]:
+    """
+    Returns all fire times between start and end (inclusive of start).
+    Useful for backfilling or auditing missed training runs.
+    """
+    if not is_valid_cron(cron_string):
+        raise ValueError(f"Invalid cron string: '{cron_string}'")
+
+    cron = croniter(cron_string, start)
+    times = []
+    while True:
+        fire = cron.get_next(datetime)
+        if fire > end:
+            break
+        times.append(fire)
+    return times
 
 
 ================================================
 FILE: sentinel/utils/logging.py
 ================================================
-[Empty file]
+# sentinel/utils/logging.py
+
+import logging
+import sys
+from typing import Optional
+
+
+_SENTINEL_LOGGER_NAME = "sentinel"
+
+
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """
+    Returns a logger namespaced under 'sentinel'.
+
+    Usage:
+        logger = get_logger(__name__)
+        logger.info("Scraper started")
+    """
+    logger_name = f"{_SENTINEL_LOGGER_NAME}.{name}" if name else _SENTINEL_LOGGER_NAME
+    return logging.getLogger(logger_name)
+
+
+def configure_logging(level: str = "INFO") -> None:
+    """
+    Configure the root sentinel logger with a clean formatter.
+    Should be called once at startup in core.py.
+
+    level: "DEBUG", "INFO", "WARNING", "ERROR"
+    """
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+
+    logger = logging.getLogger(_SENTINEL_LOGGER_NAME)
+    logger.setLevel(numeric_level)
+
+    if logger.handlers:
+        return  # already configured, don't add duplicate handlers
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(numeric_level)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
 
 
 ================================================
@@ -3251,7 +3420,123 @@ def align_timestamp_to_granularity(timestamp: float, granularity: str) -> float:
 ================================================
 FILE: sentinel/utils/validation.py
 ================================================
-[Empty file]
+# sentinel/utils/validation.py
+
+from sentinel.utils.time import parse_duration_to_seconds, parse_duration_to_steps
+from sentinel.utils.cron import is_valid_cron
+
+
+class ConfigValidationError(Exception):
+    pass
+
+
+def validate_duration(value: str, field_name: str) -> None:
+    """
+    Raises ConfigValidationError if value is not a valid duration string.
+    """
+    try:
+        parse_duration_to_seconds(value)
+    except ValueError as e:
+        raise ConfigValidationError(f"Invalid duration for '{field_name}': {e}")
+
+
+def validate_cron(value: str, field_name: str) -> None:
+    """
+    Raises ConfigValidationError if value is not a valid cron string.
+    """
+    if not is_valid_cron(value):
+        raise ConfigValidationError(
+            f"Invalid cron string for '{field_name}': '{value}'. "
+            f"Expected standard 5-field cron e.g. '0 */6 * * *'."
+        )
+
+
+def validate_horizon_divisible_by_granularity(horizon: str, granularity: str) -> None:
+    """
+    Raises ConfigValidationError if horizon is not evenly divisible by granularity.
+    """
+    try:
+        parse_duration_to_steps(horizon, granularity)
+    except ValueError as e:
+        raise ConfigValidationError(str(e))
+
+
+def validate_lookback_greater_than_horizon(lookback: str, horizon: str) -> None:
+    """
+    Raises ConfigValidationError if lookback <= horizon.
+    A lookback window must be larger than the prediction horizon.
+    """
+    lookback_secs = parse_duration_to_seconds(lookback)
+    horizon_secs = parse_duration_to_seconds(horizon)
+    if lookback_secs <= horizon_secs:
+        raise ConfigValidationError(
+            f"lookback '{lookback}' must be greater than horizon '{horizon}'."
+        )
+
+
+def validate_thresholds(finetune: float, retrain: float) -> None:
+    """
+    Raises ConfigValidationError if drift thresholds are misconfigured.
+    finetune threshold must be less than retrain threshold.
+    Both must be positive.
+    """
+    if finetune <= 0 or retrain <= 0:
+        raise ConfigValidationError(
+            "Drift thresholds must be positive floats."
+        )
+    if finetune >= retrain:
+        raise ConfigValidationError(
+            f"drift_finetune_threshold ({finetune}) must be less than "
+            f"drift_retrain_threshold ({retrain})."
+        )
+
+
+def validate_watch_config(watch) -> None:
+    """
+    Full validation pass on a WatchConfig instance.
+    Raises ConfigValidationError on first failure found.
+    """
+    if not watch.metric or not isinstance(watch.metric, str):
+        raise ConfigValidationError("WatchConfig.metric must be a non-empty string.")
+
+    if watch.model_class is None:
+        raise ConfigValidationError(
+            f"WatchConfig for '{watch.metric}' has no model_class set."
+        )
+
+    validate_cron(watch.cron, "cron")
+    validate_duration(watch.granularity, "granularity")
+    validate_duration(watch.horizon, "horizon")
+    validate_duration(watch.lookback, "lookback")
+    validate_horizon_divisible_by_granularity(watch.horizon, watch.granularity)
+    validate_lookback_greater_than_horizon(watch.lookback, watch.horizon)
+    validate_thresholds(watch.drift_finetune_threshold, watch.drift_retrain_threshold)
+
+
+def validate_sentinel_config(config) -> None:
+    """
+    Full validation pass on a SentinelConfig instance.
+    """
+    if not config.prometheus_url:
+        raise ConfigValidationError("SentinelConfig.prometheus_url must not be empty.")
+
+    if not (1 <= config.emitter_port <= 65535):
+        raise ConfigValidationError(
+            f"emitter_port {config.emitter_port} is not a valid port number."
+        )
+
+    if config.max_versions_per_metric < 1:
+        raise ConfigValidationError(
+            "max_versions_per_metric must be at least 1."
+        )
+
+    if not config.watches:
+        raise ConfigValidationError(
+            "SentinelConfig.watches is empty â€” nothing to watch."
+        )
+
+    for watch in config.watches:
+        validate_watch_config(watch)
 
 
 ================================================
@@ -3261,9 +3546,133 @@ FILE: tests/__init__.py
 
 
 ================================================
-FILE: tests/test_emitter/test_formatter.py
+FILE: tests/test_emitter/__init__.py
 ================================================
 [Empty file]
+
+
+================================================
+FILE: tests/test_emitter/test_formatter.py
+================================================
+# tests/test_emitter/test_formatter.py
+
+import pytest
+import numpy as np
+from sentinel.emitter.formatter import (
+    format_prediction,
+    build_metric_key,
+    FormattedPrediction,
+)
+from sentinel.pipeline.models.base import PredictionResult
+from sentinel.config import WatchConfig
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+
+
+def _make_watch(labels=None):
+    return WatchConfig(
+        metric="http_request_duration_seconds",
+        labels=labels or {"job": "api"},
+        model_class=ExponentialSmoothingModel,
+        granularity="1m",
+        horizon="5m",
+        lookback="30m",
+    )
+
+
+def _make_result(n_steps=5, with_bounds=False):
+    values = np.linspace(1.0, 2.0, n_steps)
+    timestamps = np.array([1700000060.0 * (i + 1) for i in range(n_steps)])
+    lower = values - 0.1 if with_bounds else None
+    upper = values + 0.1 if with_bounds else None
+    return PredictionResult(
+        values=values,
+        timestamps=timestamps,
+        lower_bound=lower,
+        upper_bound=upper,
+        model_version="v1",
+    )
+
+
+class TestFormatPrediction:
+
+    def test_returns_one_formatted_prediction_by_default(self):
+        watch = _make_watch()
+        result = _make_result()
+        formatted = format_prediction(watch, result, emit_confidence_bounds=False)
+        assert len(formatted) == 1
+
+    def test_returns_three_with_confidence_bounds(self):
+        watch = _make_watch()
+        result = _make_result(with_bounds=True)
+        formatted = format_prediction(watch, result, emit_confidence_bounds=True)
+        assert len(formatted) == 3
+
+    def test_metric_name_has_suffix(self):
+        watch = _make_watch()
+        result = _make_result()
+        formatted = format_prediction(watch, result)
+        assert formatted[0].metric_name == "http_request_duration_seconds_sentinel_predicted"
+
+    def test_steps_count_matches_horizon(self):
+        watch = _make_watch()
+        result = _make_result(n_steps=5)
+        formatted = format_prediction(watch, result)
+        assert len(formatted[0].steps) == 5
+
+    def test_steps_are_one_indexed(self):
+        watch = _make_watch()
+        result = _make_result(n_steps=3)
+        formatted = format_prediction(watch, result)
+        steps = [s["step"] for s in formatted[0].steps]
+        assert steps == [1, 2, 3]
+
+    def test_labels_carry_original_labels(self):
+        watch = _make_watch(labels={"job": "api"})
+        result = _make_result()
+        formatted = format_prediction(watch, result)
+        assert formatted[0].labels["job"] == "api"
+
+    def test_labels_include_sentinel_metadata(self):
+        watch = _make_watch()
+        result = _make_result()
+        formatted = format_prediction(watch, result)
+        assert "sentinel_horizon" in formatted[0].labels
+        assert "sentinel_version" in formatted[0].labels
+
+    def test_sentinel_version_matches_result(self):
+        watch = _make_watch()
+        result = _make_result()
+        result.model_version = "v3"
+        formatted = format_prediction(watch, result)
+        assert formatted[0].labels["sentinel_version"] == "v3"
+
+    def test_no_bounds_emitted_when_result_has_no_bounds(self):
+        watch = _make_watch()
+        result = _make_result(with_bounds=False)
+        formatted = format_prediction(watch, result, emit_confidence_bounds=True)
+        assert len(formatted) == 1
+
+    def test_unknown_version_when_model_version_is_none(self):
+        watch = _make_watch()
+        result = _make_result()
+        result.model_version = None
+        formatted = format_prediction(watch, result)
+        assert formatted[0].labels["sentinel_version"] == "unknown"
+
+
+class TestBuildMetricKey:
+
+    def test_no_labels(self):
+        assert build_metric_key("my_metric", {}) == "my_metric"
+
+    def test_with_labels(self):
+        key = build_metric_key("my_metric", {"job": "api", "env": "prod"})
+        assert key == 'my_metric{env="prod",job="api"}'
+
+    def test_labels_sorted(self):
+        key1 = build_metric_key("m", {"b": "2", "a": "1"})
+        key2 = build_metric_key("m", {"a": "1", "b": "2"})
+        assert key1 == key2
 
 
 ================================================
@@ -3273,15 +3682,334 @@ FILE: tests/test_emitter/test_server.py
 
 
 ================================================
-FILE: tests/test_ingestor/test_buffer.py
+FILE: tests/test_ingestor/__init__.py
 ================================================
 [Empty file]
+
+
+================================================
+FILE: tests/test_ingestor/test_buffer.py
+================================================
+# tests/test_ingestor/test_buffer.py
+
+import time
+import pytest
+import numpy as np
+from sentinel.ingestor.buffer import MetricBuffer, BufferRegistry
+
+
+class TestMetricBuffer:
+
+    def _make_buffer(self, lookback="5m", granularity="1m"):
+        return MetricBuffer(metric="test_metric", lookback=lookback, granularity=granularity)
+
+    def test_push_single(self):
+        buf = self._make_buffer()
+        buf.push(1000.0, 42.0)
+        assert len(buf) == 1
+
+    def test_push_many(self):
+        buf = self._make_buffer()
+        samples = [(float(i), float(i * 2)) for i in range(10)]
+        buf.push_many(samples)
+        assert len(buf) == 5  # maxlen is 5 (5m / 1m)
+
+    def test_evicts_oldest_on_overflow(self):
+        buf = self._make_buffer()
+        for i in range(10):
+            buf.push(float(i), float(i))
+        values = buf.get_values()
+        assert values[0] == 5.0  # first 5 evicted
+
+    def test_get_values_returns_ndarray(self):
+        buf = self._make_buffer()
+        buf.push(1.0, 99.0)
+        values = buf.get_values()
+        assert isinstance(values, np.ndarray)
+        assert values[0] == 99.0
+
+    def test_get_timestamps_returns_ndarray(self):
+        buf = self._make_buffer()
+        buf.push(1234.0, 99.0)
+        timestamps = buf.get_timestamps()
+        assert isinstance(timestamps, np.ndarray)
+        assert timestamps[0] == 1234.0
+
+    def test_get_samples(self):
+        buf = self._make_buffer()
+        buf.push(1.0, 2.0)
+        buf.push(3.0, 4.0)
+        samples = buf.get_samples()
+        assert samples == [(1.0, 2.0), (3.0, 4.0)]
+
+    def test_get_recent(self):
+        buf = self._make_buffer()
+        for i in range(5):
+            buf.push(float(i), float(i))
+        recent = buf.get_recent(3)
+        assert list(recent) == [2.0, 3.0, 4.0]
+
+    def test_get_recent_fewer_than_n(self):
+        buf = self._make_buffer()
+        buf.push(1.0, 10.0)
+        recent = buf.get_recent(10)
+        assert len(recent) == 1
+
+    def test_is_ready_false_when_not_full(self):
+        buf = self._make_buffer()
+        buf.push(1.0, 1.0)
+        assert buf.is_ready() is False
+
+    def test_is_ready_true_when_full(self):
+        buf = self._make_buffer()
+        for i in range(5):
+            buf.push(float(i), float(i))
+        assert buf.is_ready() is True
+
+    def test_fill_fraction(self):
+        buf = self._make_buffer()
+        buf.push(1.0, 1.0)
+        buf.push(2.0, 2.0)
+        assert buf.fill_fraction() == pytest.approx(2 / 5)
+
+    def test_fill_fraction_full(self):
+        buf = self._make_buffer()
+        for i in range(5):
+            buf.push(float(i), float(i))
+        assert buf.fill_fraction() == pytest.approx(1.0)
+
+    def test_capacity(self):
+        buf = self._make_buffer()
+        assert buf.capacity() == 5
+
+    def test_clear(self):
+        buf = self._make_buffer()
+        for i in range(5):
+            buf.push(float(i), float(i))
+        buf.clear()
+        assert len(buf) == 0
+
+    def test_thread_safety(self):
+        import threading
+        buf = self._make_buffer(lookback="10m", granularity="1m")
+        errors = []
+
+        def writer():
+            try:
+                for i in range(50):
+                    buf.push(float(i), float(i))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+
+
+class TestBufferRegistry:
+
+    def test_register_and_get(self):
+        reg = BufferRegistry()
+        buf = reg.register(key="m1", metric="m1", lookback="5m", granularity="1m")
+        assert reg.get("m1") is buf
+
+    def test_register_duplicate_returns_existing(self):
+        reg = BufferRegistry()
+        buf1 = reg.register(key="m1", metric="m1", lookback="5m", granularity="1m")
+        buf2 = reg.register(key="m1", metric="m1", lookback="5m", granularity="1m")
+        assert buf1 is buf2
+
+    def test_get_missing_returns_none(self):
+        reg = BufferRegistry()
+        assert reg.get("nonexistent") is None
+
+    def test_all_ready_false_when_empty_buffers(self):
+        reg = BufferRegistry()
+        reg.register(key="m1", metric="m1", lookback="5m", granularity="1m")
+        assert reg.all_ready() is False
+
+    def test_all_ready_true_when_all_full(self):
+        reg = BufferRegistry()
+        buf = reg.register(key="m1", metric="m1", lookback="5m", granularity="1m")
+        for i in range(5):
+            buf.push(float(i), float(i))
+        assert reg.all_ready() is True
+
+    def test_keys(self):
+        reg = BufferRegistry()
+        reg.register(key="m1", metric="m1", lookback="5m", granularity="1m")
+        reg.register(key="m2", metric="m2", lookback="5m", granularity="1m")
+        assert set(reg.keys()) == {"m1", "m2"}
 
 
 ================================================
 FILE: tests/test_ingestor/test_features.py
 ================================================
-[Empty file]
+# tests/test_ingestor/test_features.py
+
+import pytest
+import numpy as np
+from sentinel.ingestor.features import (
+    build_lag_features,
+    build_feature_matrix,
+    build_prediction_input,
+)
+
+
+class TestBuildLagFeatures:
+
+    def test_basic_shape(self):
+        values = np.arange(10, dtype=float)
+        X, y = build_lag_features(values, n_lags=3)
+        assert X.shape == (7, 3)
+        assert y.shape == (7,)
+
+    def test_first_row(self):
+        values = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        X, y = build_lag_features(values, n_lags=3)
+        assert list(X[0]) == [1.0, 2.0, 3.0]
+        assert y[0] == 4.0
+
+    def test_last_row(self):
+        values = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        X, y = build_lag_features(values, n_lags=3)
+        assert list(X[-1]) == [2.0, 3.0, 4.0]
+        assert y[-1] == 5.0
+
+    def test_not_enough_values_raises(self):
+        values = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            build_lag_features(values, n_lags=3)
+
+    def test_single_lag(self):
+        values = np.array([1.0, 2.0, 3.0])
+        X, y = build_lag_features(values, n_lags=1)
+        assert X.shape == (2, 1)
+        assert y.shape == (2,)
+
+
+class TestBuildFeatureMatrix:
+
+    def _make_values(self, n=50):
+        return np.linspace(0, 10, n)
+
+    def _make_timestamps(self, n=50):
+        base = 1700000000.0
+        return np.array([base + i * 60 for i in range(n)])
+
+    def test_output_shapes_consistent(self):
+        values = self._make_values()
+        X, y = build_feature_matrix(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_rolling_mean=True,
+            include_rolling_std=True,
+            include_time_features=False,
+        )
+        assert X.shape[0] == y.shape[0]
+        assert X.shape[1] > 5  # lags + rolling mean + rolling std
+
+    def test_with_time_features(self):
+        values = self._make_values()
+        timestamps = self._make_timestamps()
+        X, y = build_feature_matrix(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_time_features=True,
+            timestamps=timestamps,
+        )
+        assert X.shape[1] == 5 + 1 + 1 + 4  # lags + mean + std + 4 time features
+
+    def test_without_optional_features(self):
+        values = self._make_values()
+        X, y = build_feature_matrix(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_rolling_mean=False,
+            include_rolling_std=False,
+            include_time_features=False,
+        )
+        assert X.shape[1] == 5  # only lag features
+
+    def test_time_features_without_timestamps_skipped(self):
+        values = self._make_values()
+        X, y = build_feature_matrix(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_rolling_mean=False,
+            include_rolling_std=False,
+            include_time_features=True,
+            timestamps=None,
+        )
+        assert X.shape[1] == 5  # time features skipped gracefully
+
+
+class TestBuildPredictionInput:
+
+    def _make_values(self, n=50):
+        return np.linspace(0, 10, n)
+
+    def _make_timestamps(self, n=50):
+        base = 1700000000.0
+        return np.array([base + i * 60 for i in range(n)])
+
+    def test_output_shape(self):
+        values = self._make_values()
+        X = build_prediction_input(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_rolling_mean=False,
+            include_rolling_std=False,
+            include_time_features=False,
+        )
+        assert X.shape == (1, 5)
+
+    def test_uses_last_n_values(self):
+        values = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+        X = build_prediction_input(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_rolling_mean=False,
+            include_rolling_std=False,
+            include_time_features=False,
+        )
+        assert list(X[0]) == [3.0, 4.0, 5.0, 6.0, 7.0]
+
+    def test_not_enough_values_raises(self):
+        values = np.array([1.0, 2.0])
+        with pytest.raises(ValueError):
+            build_prediction_input(
+                values=values,
+                lookback="5m",
+                granularity="1m",
+                include_rolling_mean=False,
+                include_rolling_std=False,
+                include_time_features=False,
+            )
+
+    def test_with_all_features(self):
+        values = self._make_values()
+        timestamps = self._make_timestamps()
+        X = build_prediction_input(
+            values=values,
+            lookback="5m",
+            granularity="1m",
+            include_rolling_mean=True,
+            include_rolling_std=True,
+            include_time_features=True,
+            timestamps=timestamps,
+        )
+        assert X.shape == (1, 5 + 1 + 1 + 4)
 
 
 ================================================
@@ -3291,21 +4019,361 @@ FILE: tests/test_ingestor/test_scraper.py
 
 
 ================================================
-FILE: tests/test_pipeline/test_drift.py
+FILE: tests/test_pipeline/__init__.py
 ================================================
 [Empty file]
+
+
+================================================
+FILE: tests/test_pipeline/test_drift.py
+================================================
+# tests/test_pipeline/test_drift.py
+
+import pytest
+import numpy as np
+from sentinel.pipeline.drift import DriftMonitor, DriftSeverity, DriftResult
+
+
+class TestDriftMonitor:
+
+    def _make_monitor(self, finetune=0.1, retrain=0.3, window=10):
+        return DriftMonitor(
+            metric="test_metric",
+            finetune_threshold=finetune,
+            retrain_threshold=retrain,
+            window_size=window,
+        )
+
+    def test_initial_check_returns_none_severity(self):
+        monitor = self._make_monitor()
+        result = monitor.check()
+        assert result.severity == DriftSeverity.NONE
+        assert result.mae == 0.0
+
+    def test_record_single(self):
+        monitor = self._make_monitor()
+        monitor.record(predicted=1.0, actual=1.05)
+        assert monitor.sample_count() == 1
+
+    def test_no_drift_below_threshold(self):
+        monitor = self._make_monitor()
+        for _ in range(5):
+            monitor.record(predicted=1.0, actual=1.01)  # MAE = 0.01
+        result = monitor.check()
+        assert result.severity == DriftSeverity.NONE
+
+    def test_low_drift_between_thresholds(self):
+        monitor = self._make_monitor(finetune=0.1, retrain=0.3)
+        for _ in range(5):
+            monitor.record(predicted=1.0, actual=1.2)  # MAE = 0.2
+        result = monitor.check()
+        assert result.severity == DriftSeverity.LOW
+
+    def test_high_drift_above_retrain_threshold(self):
+        monitor = self._make_monitor(finetune=0.1, retrain=0.3)
+        for _ in range(5):
+            monitor.record(predicted=1.0, actual=1.5)  # MAE = 0.5
+        result = monitor.check()
+        assert result.severity == DriftSeverity.HIGH
+
+    def test_record_many(self):
+        monitor = self._make_monitor()
+        predicted = np.array([1.0, 2.0, 3.0])
+        actual = np.array([1.1, 2.1, 3.1])
+        monitor.record_many(predicted, actual)
+        assert monitor.sample_count() == 3
+        assert monitor.current_mae() == pytest.approx(0.1, abs=1e-6)
+
+    def test_window_evicts_old_samples(self):
+        monitor = self._make_monitor(window=3)
+        for _ in range(3):
+            monitor.record(predicted=1.0, actual=1.5)  # high residuals
+        for _ in range(3):
+            monitor.record(predicted=1.0, actual=1.01)  # low residuals
+        # only last 3 should count
+        assert monitor.current_mae() == pytest.approx(0.01, abs=1e-6)
+
+    def test_reset_clears_residuals(self):
+        monitor = self._make_monitor()
+        for _ in range(5):
+            monitor.record(predicted=1.0, actual=2.0)
+        monitor.reset()
+        assert monitor.sample_count() == 0
+        assert monitor.current_mae() == 0.0
+        result = monitor.check()
+        assert result.severity == DriftSeverity.NONE
+
+    def test_current_mae_empty(self):
+        monitor = self._make_monitor()
+        assert monitor.current_mae() == 0.0
+
+    def test_drift_result_carries_thresholds(self):
+        monitor = self._make_monitor(finetune=0.1, retrain=0.3)
+        monitor.record(1.0, 1.2)
+        result = monitor.check()
+        assert result.threshold_finetune == 0.1
+        assert result.threshold_retrain == 0.3
+
+    def test_thread_safety(self):
+        import threading
+        monitor = self._make_monitor(window=100)
+        errors = []
+
+        def recorder():
+            try:
+                for _ in range(50):
+                    monitor.record(1.0, 1.1)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=recorder) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
 
 
 ================================================
 FILE: tests/test_pipeline/test_predictor.py
 ================================================
-[Empty file]
+# tests/test_pipeline/test_predictor.py
+
+import pytest
+import numpy as np
+from sentinel.pipeline.versioning import VersionStore
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.trainer import Trainer
+from sentinel.pipeline.predictor import Predictor
+from sentinel.ingestor.buffer import MetricBuffer
+from sentinel.config import WatchConfig
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+from sentinel.pipeline.drift import DriftSeverity
+
+
+def _make_watch():
+    return WatchConfig(
+        metric="test_metric",
+        labels={},
+        model_class=ExponentialSmoothingModel,
+        granularity="1m",
+        horizon="5m",
+        lookback="30m",
+        cron="0 */6 * * *",
+    )
+
+
+def _fill_buffer(buf, n=35):
+    for i in range(n):
+        buf.push(float(1700000000 + i * 60), float(i) + np.random.normal(0, 0.1))
+
+
+@pytest.fixture
+def trained_setup(tmp_path):
+    watch = _make_watch()
+    buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
+    _fill_buffer(buf, n=35)
+
+    store = VersionStore(
+        metric_key="test_metric",
+        artifact_store=str(tmp_path),
+        max_versions=5,
+    )
+    registry = ModelRegistry(metric_key="test_metric", version_store=store)
+    trainer = Trainer(watch_config=watch, buffer=buf, registry=registry)
+    trainer.run(drift_severity=DriftSeverity.NONE)
+
+    return watch, buf, registry
+
+
+class TestPredictor:
+
+    def test_returns_none_when_model_not_ready(self, tmp_path):
+        watch = _make_watch()
+        buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
+        _fill_buffer(buf, n=35)
+        store = VersionStore(
+            metric_key="test_metric",
+            artifact_store=str(tmp_path),
+            max_versions=5,
+        )
+        registry = ModelRegistry(metric_key="test_metric", version_store=store)
+        predictor = Predictor(watch_config=watch, buffer=buf, registry=registry)
+        result = predictor.predict()
+        assert result is None
+
+    def test_returns_prediction_result_after_training(self, trained_setup):
+        watch, buf, registry = trained_setup
+        predictor = Predictor(watch_config=watch, buffer=buf, registry=registry)
+        result = predictor.predict()
+        assert result is not None
+
+    def test_prediction_values_length_equals_horizon_steps(self, trained_setup):
+        watch, buf, registry = trained_setup
+        predictor = Predictor(watch_config=watch, buffer=buf, registry=registry)
+        result = predictor.predict()
+        # horizon=5m, granularity=1m -> 5 steps
+        assert len(result.values) == 5
+
+    def test_prediction_timestamps_in_future(self, trained_setup):
+        import time
+        watch, buf, registry = trained_setup
+        predictor = Predictor(watch_config=watch, buffer=buf, registry=registry)
+        result = predictor.predict()
+        now = time.time()
+        assert all(ts > now for ts in result.timestamps)
+
+    def test_prediction_has_model_version(self, trained_setup):
+        watch, buf, registry = trained_setup
+        predictor = Predictor(watch_config=watch, buffer=buf, registry=registry)
+        result = predictor.predict()
+        assert result.model_version is not None
+
+    def test_returns_none_when_buffer_insufficient(self, tmp_path):
+        watch = _make_watch()
+        buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
+        buf.push(1.0, 1.0)  # only one sample
+
+        store = VersionStore(
+            metric_key="test_metric",
+            artifact_store=str(tmp_path),
+            max_versions=5,
+        )
+        registry = ModelRegistry(metric_key="test_metric", version_store=store)
+        predictor = Predictor(watch_config=watch, buffer=buf, registry=registry)
+        result = predictor.predict()
+        assert result is None
 
 
 ================================================
 FILE: tests/test_pipeline/test_registry.py
 ================================================
-[Empty file]
+# tests/test_pipeline/test_registry.py
+
+import os
+import pytest
+import tempfile
+import numpy as np
+from sentinel.pipeline.versioning import VersionStore, ModelVersion
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+
+
+def _make_version(version_id="v1", mae=0.05):
+    return ModelVersion(
+        version_id=version_id,
+        metric_key="test_metric",
+        model_class="ExponentialSmoothingModel",
+        trained_at="2024-01-01T00:00:00+00:00",
+        training_policy="full_retrain",
+        drift_score_at_trigger=0.0,
+        mae=mae,
+        mape=1.0,
+        n_samples=100,
+        artifact_path="",
+        extra={"granularity": "1m", "horizon": "5m", "lookback": "30m"},
+    )
+
+
+def _make_model():
+    return ExponentialSmoothingModel(
+        granularity="1m",
+        horizon="5m",
+        lookback="30m",
+    )
+
+
+def _fit_model(model):
+    y = np.linspace(1, 10, 50)
+    X = np.zeros((50, 30))
+    model.fit(X, y)
+    return model
+
+
+@pytest.fixture
+def tmp_store(tmp_path):
+    return VersionStore(
+        metric_key="test_metric",
+        artifact_store=str(tmp_path),
+        max_versions=5,
+    )
+
+
+@pytest.fixture
+def registry(tmp_store):
+    return ModelRegistry(metric_key="test_metric", version_store=tmp_store)
+
+
+class TestModelRegistry:
+
+    def test_initial_not_ready(self, registry):
+        assert registry.is_ready() is False
+
+    def test_get_model_returns_none_initially(self, registry):
+        assert registry.get_model() is None
+
+    def test_promote_makes_registry_ready(self, registry):
+        model = _fit_model(_make_model())
+        version = _make_version()
+        registry.promote(model, version)
+        assert registry.is_ready() is True
+
+    def test_promote_sets_active_version(self, registry):
+        model = _fit_model(_make_model())
+        version = _make_version(version_id="v1")
+        registry.promote(model, version)
+        assert registry.active_version().version_id == "v1"
+
+    def test_promote_saves_artifact(self, registry, tmp_path):
+        model = _fit_model(_make_model())
+        version = _make_version(version_id="v1")
+        registry.promote(model, version)
+        assert os.path.exists(version.artifact_path)
+
+    def test_get_model_returns_promoted_model(self, registry):
+        model = _fit_model(_make_model())
+        version = _make_version()
+        registry.promote(model, version)
+        assert registry.get_model() is model
+
+    def test_rollback_with_no_previous_returns_false(self, registry):
+        model = _fit_model(_make_model())
+        version = _make_version(version_id="v1")
+        registry.promote(model, version)
+        result = registry.rollback()
+        assert result is False
+
+    def test_rollback_restores_previous(self, registry):
+        model1 = _fit_model(_make_model())
+        version1 = _make_version(version_id="v1")
+        registry.promote(model1, version1)
+
+        model2 = _fit_model(_make_model())
+        version2 = _make_version(version_id="v2")
+        registry.promote(model2, version2)
+
+        assert registry.active_version().version_id == "v2"
+        result = registry.rollback()
+        assert result is True
+        assert registry.active_version().version_id == "v1"
+
+    def test_restore_from_disk_no_artifact(self, registry):
+        result = registry.restore_from_disk(lambda: _make_model())
+        assert result is False
+
+    def test_restore_from_disk_after_promote(self, registry, tmp_store):
+        model = _fit_model(_make_model())
+        version = _make_version(version_id="v1")
+        registry.promote(model, version)
+
+        new_registry = ModelRegistry(
+            metric_key="test_metric",
+            version_store=tmp_store,
+        )
+        result = new_registry.restore_from_disk(lambda: _make_model())
+        assert result is True
+        assert new_registry.is_ready() is True
 
 
 ================================================
@@ -3317,17 +4385,371 @@ FILE: tests/test_pipeline/test_scheduler.py
 ================================================
 FILE: tests/test_pipeline/test_trainer.py
 ================================================
+# tests/test_pipeline/test_trainer.py
+
+import pytest
+import numpy as np
+from sentinel.pipeline.drift import DriftSeverity
+from sentinel.pipeline.versioning import VersionStore
+from sentinel.pipeline.registry import ModelRegistry
+from sentinel.pipeline.trainer import Trainer
+from sentinel.ingestor.buffer import MetricBuffer
+from sentinel.config import WatchConfig
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+from sentinel.pipeline.models.linear import LinearTrendModel
+
+
+def _make_watch_config(model_class=None):
+    return WatchConfig(
+        metric="test_metric",
+        labels={},
+        model_class=model_class or ExponentialSmoothingModel,
+        granularity="1m",
+        horizon="5m",
+        lookback="30m",
+        cron="0 */6 * * *",
+    )
+
+
+def _fill_buffer(buf, n=35):
+    for i in range(n):
+        buf.push(float(1700000000 + i * 60), float(i) + np.random.normal(0, 0.1))
+
+
+@pytest.fixture
+def tmp_registry(tmp_path):
+    store = VersionStore(
+        metric_key="test_metric",
+        artifact_store=str(tmp_path),
+        max_versions=5,
+    )
+    return ModelRegistry(metric_key="test_metric", version_store=store)
+
+
+@pytest.fixture
+def buffer():
+    buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
+    _fill_buffer(buf, n=35)
+    return buf
+
+
+class TestTrainer:
+
+    def test_run_cold_start_promotes_model(self, buffer, tmp_registry):
+        watch = _make_watch_config()
+        trainer = Trainer(watch_config=watch, buffer=buffer, registry=tmp_registry)
+        result = trainer.run(drift_severity=DriftSeverity.NONE, drift_score=0.0)
+        assert result is not None
+        assert tmp_registry.is_ready()
+
+    def test_run_returns_training_result(self, buffer, tmp_registry):
+        watch = _make_watch_config()
+        trainer = Trainer(watch_config=watch, buffer=buffer, registry=tmp_registry)
+        result = trainer.run()
+        assert result is not None
+        assert result.mae >= 0
+        assert result.mape >= 0
+        assert result.n_samples > 0
+
+    def test_full_retrain_policy_on_high_drift(self, buffer, tmp_registry):
+        watch = _make_watch_config()
+        trainer = Trainer(watch_config=watch, buffer=buffer, registry=tmp_registry)
+        trainer.run(drift_severity=DriftSeverity.NONE)
+        result = trainer.run(drift_severity=DriftSeverity.HIGH, drift_score=0.5)
+        assert result is not None
+        assert result.training_policy == "full_retrain"
+
+    def test_finetune_policy_on_low_drift(self, buffer, tmp_registry):
+        watch = _make_watch_config(model_class=LinearTrendModel)
+        trainer = Trainer(watch_config=watch, buffer=buffer, registry=tmp_registry)
+        trainer.run(drift_severity=DriftSeverity.NONE)
+        result = trainer.run(drift_severity=DriftSeverity.LOW, drift_score=0.15)
+        assert result is not None
+        assert result.training_policy == "finetune"
+
+    def test_run_with_empty_buffer_returns_none(self, tmp_registry):
+        watch = _make_watch_config()
+        buf = MetricBuffer(metric="test_metric", lookback="30m", granularity="1m")
+        trainer = Trainer(watch_config=watch, buffer=buf, registry=tmp_registry)
+        result = trainer.run()
+        assert result is None
+
+    def test_version_increments_on_each_run(self, buffer, tmp_registry):
+        watch = _make_watch_config()
+        trainer = Trainer(watch_config=watch, buffer=buffer, registry=tmp_registry)
+        trainer.run()
+        trainer.run()
+        versions = tmp_registry.version_store.get_all()
+        assert len(versions) == 2
+
+
+================================================
+FILE: tests/test_utils/__init__.py
+================================================
 [Empty file]
 
 
 ================================================
 FILE: tests/test_utils/test_cron.py
 ================================================
-[Empty file]
+# tests/test_utils/test_cron.py
+
+import pytest
+from datetime import datetime, timezone, timedelta
+from sentinel.utils.cron import (
+    is_valid_cron,
+    get_next_fire_time,
+    get_previous_fire_time,
+    seconds_until_next_fire,
+    seconds_since_last_fire,
+    get_fire_times_between,
+)
+
+
+class TestIsValidCron:
+
+    def test_valid_every_hour(self):
+        assert is_valid_cron("0 * * * *") is True
+
+    def test_valid_every_six_hours(self):
+        assert is_valid_cron("0 */6 * * *") is True
+
+    def test_valid_every_minute(self):
+        assert is_valid_cron("* * * * *") is True
+
+    def test_invalid_too_few_fields(self):
+        assert is_valid_cron("* * * *") is False
+
+    def test_invalid_out_of_range(self):
+        assert is_valid_cron("60 * * * *") is False
+
+    def test_invalid_empty_string(self):
+        assert is_valid_cron("") is False
+
+    def test_invalid_random_string(self):
+        assert is_valid_cron("every six hours") is False
+
+
+class TestGetNextFireTime:
+
+    def test_next_is_in_future(self):
+        base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        next_fire = get_next_fire_time("0 * * * *", base=base)
+        assert next_fire > base
+
+    def test_every_hour_increments_by_one_hour(self):
+        base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        next_fire = get_next_fire_time("0 * * * *", base=base)
+        assert next_fire == datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+
+    def test_invalid_cron_raises(self):
+        with pytest.raises(ValueError):
+            get_next_fire_time("not a cron")
+
+
+class TestGetPreviousFireTime:
+
+    def test_prev_is_in_past(self):
+        base = datetime(2024, 1, 1, 12, 30, 0, tzinfo=timezone.utc)
+        prev_fire = get_previous_fire_time("0 * * * *", base=base)
+        assert prev_fire < base
+
+    def test_every_hour_returns_last_hour(self):
+        base = datetime(2024, 1, 1, 12, 30, 0, tzinfo=timezone.utc)
+        prev_fire = get_previous_fire_time("0 * * * *", base=base)
+        assert prev_fire == datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_invalid_cron_raises(self):
+        with pytest.raises(ValueError):
+            get_previous_fire_time("not a cron")
+
+
+class TestSecondsUntilNextFire:
+
+    def test_returns_positive(self):
+        base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        secs = seconds_until_next_fire("0 * * * *", base=base)
+        assert secs > 0
+
+    def test_roughly_one_hour(self):
+        base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        secs = seconds_until_next_fire("0 * * * *", base=base)
+        assert abs(secs - 3600) < 5
+
+
+class TestSecondsSinceLastFire:
+
+    def test_returns_positive(self):
+        base = datetime(2024, 1, 1, 12, 30, 0, tzinfo=timezone.utc)
+        secs = seconds_since_last_fire("0 * * * *", base=base)
+        assert secs > 0
+
+    def test_roughly_thirty_minutes(self):
+        base = datetime(2024, 1, 1, 12, 30, 0, tzinfo=timezone.utc)
+        secs = seconds_since_last_fire("0 * * * *", base=base)
+        assert abs(secs - 1800) < 5
+
+
+class TestGetFireTimesBetween:
+
+    def test_correct_count(self):
+        start = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        end = datetime(2024, 1, 1, 6, 0, 0, tzinfo=timezone.utc)
+        fires = get_fire_times_between("0 * * * *", start=start, end=end)
+        assert len(fires) == 6
+
+    def test_all_within_range(self):
+        start = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        end = datetime(2024, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+        fires = get_fire_times_between("0 * * * *", start=start, end=end)
+        for f in fires:
+            assert start < f <= end
+
+    def test_empty_when_no_fires_in_range(self):
+        start = datetime(2024, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+        end = datetime(2024, 1, 1, 12, 59, 0, tzinfo=timezone.utc)
+        fires = get_fire_times_between("0 * * * *", start=start, end=end)
+        assert fires == []
+
+    def test_invalid_cron_raises(self):
+        with pytest.raises(ValueError):
+            get_fire_times_between(
+                "bad cron",
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            )
 
 
 ================================================
 FILE: tests/test_utils/test_time.py
 ================================================
-[Empty file]
+# tests/test_utils/test_time.py
+
+import pytest
+from datetime import timedelta
+from sentinel.utils.time import (
+    parse_duration_to_seconds,
+    parse_duration_to_steps,
+    steps_to_timedeltas,
+    align_timestamp_to_granularity,
+)
+
+
+class TestParseDurationToSeconds:
+
+    def test_seconds(self):
+        assert parse_duration_to_seconds("30s") == 30
+
+    def test_minutes(self):
+        assert parse_duration_to_seconds("5m") == 300
+
+    def test_hours(self):
+        assert parse_duration_to_seconds("1h") == 3600
+
+    def test_days(self):
+        assert parse_duration_to_seconds("2d") == 172800
+
+    def test_weeks(self):
+        assert parse_duration_to_seconds("1w") == 604800
+
+    def test_strips_whitespace(self):
+        assert parse_duration_to_seconds("  5m  ") == 300
+
+    def test_case_insensitive(self):
+        assert parse_duration_to_seconds("5M") == 300
+
+    def test_invalid_format_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration_to_seconds("5minutes")
+
+    def test_missing_unit_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration_to_seconds("300")
+
+    def test_missing_value_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration_to_seconds("m")
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration_to_seconds("")
+
+
+class TestParseDurationToSteps:
+
+    def test_basic(self):
+        assert parse_duration_to_steps("30m", "1m") == 30
+
+    def test_hour_to_five_minutes(self):
+        assert parse_duration_to_steps("1h", "5m") == 12
+
+    def test_hour_to_thirty_seconds(self):
+        assert parse_duration_to_steps("1h", "30s") == 120
+
+    def test_same_duration_and_granularity(self):
+        assert parse_duration_to_steps("5m", "5m") == 1
+
+    def test_not_divisible_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration_to_steps("7m", "5m")
+
+    def test_granularity_larger_than_duration_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration_to_steps("1m", "5m")
+
+    def test_day_to_hours(self):
+        assert parse_duration_to_steps("1d", "1h") == 24
+
+
+class TestStepsToTimedeltas:
+
+    def test_basic(self):
+        result = steps_to_timedeltas(3, "5m")
+        assert result == [
+            timedelta(minutes=5),
+            timedelta(minutes=10),
+            timedelta(minutes=15),
+        ]
+
+    def test_with_offset(self):
+        result = steps_to_timedeltas(2, "1h", start_offset_seconds=3600)
+        assert result == [
+            timedelta(hours=2),
+            timedelta(hours=3),
+        ]
+
+    def test_single_step(self):
+        result = steps_to_timedeltas(1, "1m")
+        assert result == [timedelta(minutes=1)]
+
+    def test_seconds_granularity(self):
+        result = steps_to_timedeltas(3, "30s")
+        assert result == [
+            timedelta(seconds=30),
+            timedelta(seconds=60),
+            timedelta(seconds=90),
+        ]
+
+
+class TestAlignTimestampToGranularity:
+
+    def test_already_aligned(self):
+        ts = 1700000100.0  # already on 1m boundary
+        assert align_timestamp_to_granularity(ts, "1m") == 1700000100.0
+
+    def test_floors_to_minute(self):
+        ts = 1700000123.0
+        assert align_timestamp_to_granularity(ts, "1m") == 1700000100.0
+
+    def test_floors_to_five_minutes(self):
+        ts = 1700000423.0  # 123s past a 5m boundary
+        result = align_timestamp_to_granularity(ts, "5m")
+        assert result % 300 == 0
+        assert result <= ts
+
+    def test_floors_to_hour(self):
+        ts = 1700003723.0  # some seconds into an hour
+        result = align_timestamp_to_granularity(ts, "1h")
+        assert result % 3600 == 0
+        assert result <= ts
 
