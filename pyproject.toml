@@ -1,9 +1,25 @@
 [project]
-name = "sentinel"
+name = "sentinel-mlops"
 version = "0.1.0"
 description = "MLOps pipeline sitting between Prometheus and Grafana — pulls metrics, trains models, emits predictions"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "you@example.com" }
+]
+keywords = ["prometheus", "grafana", "mlops", "time-series", "forecasting", "monitoring"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "numpy>=1.26.0",
     "httpx>=0.27.0",
@@ -18,9 +34,17 @@ dev = [
     "pytest-cov>=5.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/sujal-maheshwari2004/Sentinel"
+Repository = "https://github.com/sujal-maheshwari2004/Sentinel"
+Issues = "https://github.com/sujal-maheshwari2004/Sentinel/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sentinel"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
