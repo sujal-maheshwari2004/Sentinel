@@ -3,7 +3,6 @@ Directory structure:
     ├── README.md
     ├── main.py
     ├── pyproject.toml
-    ├── run.ps1
     ├── .python-version
     ├── sentinel/
     │   ├── __init__.py
@@ -84,92 +83,15 @@ name = "sentinel"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = []
 
 
 
 ================================================
-FILE: run.ps1
-================================================
-$base = "."
-
-$dirs = @(
-    "sentinel/ingestor",
-    "sentinel/pipeline/models",
-    "sentinel/emitter",
-    "sentinel/utils",
-    "tests/test_ingestor",
-    "tests/test_pipeline",
-    "tests/test_emitter",
-    "tests/test_utils"
-)
-
-$files = @(
-    "sentinel/__init__.py",
-    "sentinel/core.py",
-    "sentinel/config.py",
-
-    "sentinel/ingestor/__init__.py",
-    "sentinel/ingestor/scraper.py",
-    "sentinel/ingestor/buffer.py",
-    "sentinel/ingestor/features.py",
-
-    "sentinel/pipeline/__init__.py",
-    "sentinel/pipeline/scheduler.py",
-    "sentinel/pipeline/trainer.py",
-    "sentinel/pipeline/predictor.py",
-    "sentinel/pipeline/drift.py",
-    "sentinel/pipeline/registry.py",
-    "sentinel/pipeline/versioning.py",
-
-    "sentinel/pipeline/models/__init__.py",
-    "sentinel/pipeline/models/base.py",
-    "sentinel/pipeline/models/linear.py",
-    "sentinel/pipeline/models/smoothing.py",
-    "sentinel/pipeline/models/arima.py",
-    "sentinel/pipeline/models/sgd.py",
-
-    "sentinel/emitter/__init__.py",
-    "sentinel/emitter/formatter.py",
-    "sentinel/emitter/server.py",
-
-    "sentinel/utils/__init__.py",
-    "sentinel/utils/cron.py",
-    "sentinel/utils/time.py",
-    "sentinel/utils/logging.py",
-    "sentinel/utils/validation.py",
-
-    "tests/__init__.py",
-    "tests/test_ingestor/test_scraper.py",
-    "tests/test_ingestor/test_buffer.py",
-    "tests/test_ingestor/test_features.py",
-    "tests/test_pipeline/test_scheduler.py",
-    "tests/test_pipeline/test_trainer.py",
-    "tests/test_pipeline/test_predictor.py",
-    "tests/test_pipeline/test_drift.py",
-    "tests/test_pipeline/test_registry.py",
-    "tests/test_emitter/test_formatter.py",
-    "tests/test_emitter/test_server.py",
-    "tests/test_utils/test_cron.py",
-    "tests/test_utils/test_time.py"
-)
-
-foreach ($dir in $dirs) {
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-}
-
-foreach ($file in $files) {
-    New-Item -ItemType File -Force -Path $file | Out-Null
-}
-
-Write-Host "Sentinel scaffolded successfully."
-
-
-================================================
 FILE: .python-version
 ================================================
-3.14
+3.11
 
 
 
@@ -182,13 +104,232 @@ FILE: sentinel/__init__.py
 ================================================
 FILE: sentinel/config.py
 ================================================
-[Empty file]
+# sentinel/config.py
+
+from dataclasses import dataclass, field
+from typing import Optional, Type
+from sentinel.pipeline.models.base import BaseModel
+
+
+@dataclass
+class WatchConfig:
+    """
+    Configuration for a single watched metric.
+    One WatchConfig = one model = one prediction series emitted.
+    """
+
+    metric: str
+    # e.g. {"job": "api", "instance": "localhost:8080"}
+    labels: dict[str, str] = field(default_factory=dict)
+
+    # model class to use, must be a subclass of BaseModel
+    model_class: Type[BaseModel] = None
+
+    # cron string defining cold start and retraining schedule
+    # e.g. "0 */6 * * *" = every 6 hours
+    cron: str = "0 */6 * * *"
+
+    # resolution of data points to pull and train on
+    # e.g. "1m", "5m", "1h"
+    granularity: str = "1m"
+
+    # how far ahead to predict
+    # e.g. "5m", "15m", "1h"
+    horizon: str = "5m"
+
+    # how much historical data to use as features
+    # e.g. "30m", "1h", "6h"
+    lookback: str = "30m"
+
+    # MAE threshold above which drift is considered low severity â†’ finetune
+    drift_finetune_threshold: float = 0.1
+
+    # MAE threshold above which drift is considered high severity â†’ full retrain
+    drift_retrain_threshold: float = 0.3
+
+
+@dataclass
+class SentinelConfig:
+    """
+    Top level configuration for the Sentinel instance.
+    """
+
+    # Prometheus base URL to pull metrics from
+    prometheus_url: str = "http://localhost:9090"
+
+    # port Sentinel exposes its /metrics endpoint on
+    emitter_port: int = 8080
+
+    # where serialized model artifacts are stored
+    # can be a local path or later extended to S3/GCS
+    artifact_store: str = "./sentinel_artifacts"
+
+    # how many versions to retain per metric before pruning old ones
+    max_versions_per_metric: int = 5
+
+    # list of metrics to watch
+    watches: list[WatchConfig] = field(default_factory=list)
+
+    # optional global scrape timeout in seconds
+    scrape_timeout: int = 10
+
+    # whether to emit confidence bounds alongside predictions
+    emit_confidence_bounds: bool = False
 
 
 ================================================
 FILE: sentinel/core.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/base.py
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+import numpy as np
+
+
+@dataclass
+class PredictionResult:
+    """
+    Returned by every model's predict() call.
+    horizon_steps mirrors the number of steps ahead requested.
+    """
+
+    # predicted values, length = horizon_steps
+    values: np.ndarray
+
+    # timestamps corresponding to each predicted value
+    timestamps: np.ndarray
+
+    # optional lower and upper confidence bounds, same length as values
+    lower_bound: Optional[np.ndarray] = None
+    upper_bound: Optional[np.ndarray] = None
+
+    # model version that produced this prediction
+    model_version: Optional[str] = None
+
+
+@dataclass
+class TrainingResult:
+    """
+    Returned by every model's fit() and partial_fit() calls.
+    Used by versioning and registry to record what happened.
+    """
+
+    # validation MAE on holdout set
+    mae: float
+
+    # validation MAPE on holdout set
+    mape: float
+
+    # number of samples trained on
+    n_samples: int
+
+    # whether this was a full retrain or finetune
+    training_policy: str  # "full_retrain" or "finetune"
+
+    # any model-specific metadata worth logging
+    extra: dict = field(default_factory=dict)
+
+
+class BaseModel(ABC):
+    """
+    Interface every Sentinel model must implement.
+
+    Sentinel calls these methods in this order:
+        1. fit()         â€” cold start, full retrain
+        2. predict()     â€” called on every emitter tick
+        3. partial_fit() â€” called on finetune trigger
+        4. save()        â€” called after fit/partial_fit, before promotion
+        5. load()        â€” called on startup if artifact exists
+
+    Models must be stateless between calls except for internal
+    learned parameters. All state that needs to persist across
+    restarts must be serialized by save() and restored by load().
+    """
+
+    def __init__(self, granularity: str, horizon: str, lookback: str):
+        """
+        granularity : resolution of input data e.g. "1m"
+        horizon     : how far ahead to predict e.g. "5m"
+        lookback    : size of feature window e.g. "30m"
+
+        Subclasses should call super().__init__() and then
+        initialize their own internal parameters.
+        """
+        self.granularity = granularity
+        self.horizon = horizon
+        self.lookback = lookback
+        self._is_fitted = False
+
+    @abstractmethod
+    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        """
+        Full retrain from scratch on the provided data.
+
+        X : feature matrix, shape (n_samples, n_features)
+            features are lag values auto-generated by features.py
+        y : target values, shape (n_samples,)
+            the actual metric values to predict
+
+        Must set self._is_fitted = True on success.
+        Must return a TrainingResult.
+        """
+        ...
+
+    @abstractmethod
+    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        """
+        Finetune on recent data without discarding learned parameters.
+        Called on low severity drift.
+
+        Falls back to full fit() if model has not been fitted yet.
+        Must return a TrainingResult with training_policy="finetune".
+        """
+        ...
+
+    @abstractmethod
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate multi-step ahead predictions.
+
+        X : most recent feature window, shape (1, n_features)
+            represents the latest observed state
+
+        Returns PredictionResult with len(values) == horizon_steps.
+        horizon_steps is derived from horizon / granularity internally.
+        """
+        ...
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        """
+        Serialize model state to the given path.
+        Path is managed by versioning.py, model just writes to it.
+        Format is up to the subclass â€” joblib, pickle, json etc.
+        """
+        ...
+
+    @abstractmethod
+    def load(self, path: str) -> None:
+        """
+        Restore model state from the given path.
+        Must set self._is_fitted = True on success.
+        """
+        ...
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._is_fitted
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"granularity={self.granularity}, "
+            f"horizon={self.horizon}, "
+            f"lookback={self.lookback}, "
+            f"fitted={self._is_fitted})"
+        )
 
 
 ================================================
@@ -278,13 +419,177 @@ FILE: sentinel/pipeline/versioning.py
 ================================================
 FILE: sentinel/pipeline/models/__init__.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/__init__.py
+
+from sentinel.pipeline.models.base import BaseModel, PredictionResult, TrainingResult
+from sentinel.pipeline.models.linear import LinearTrendModel
+from sentinel.pipeline.models.smoothing import ExponentialSmoothingModel
+from sentinel.pipeline.models.arima import ARIMAModel
+from sentinel.pipeline.models.sgd import SGDRegressorModel
+
+__all__ = [
+    "BaseModel",
+    "PredictionResult",
+    "TrainingResult",
+    "LinearTrendModel",
+    "ExponentialSmoothingModel",
+    "ARIMAModel",
+    "SGDRegressorModel",
+]
 
 
 ================================================
 FILE: sentinel/pipeline/models/arima.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/arima.py
+
+import numpy as np
+import joblib
+from sentinel.pipeline.models.base import BaseModel, PredictionResult, TrainingResult
+from sentinel.utils.time import parse_duration_to_steps
+
+
+class ARIMAModel(BaseModel):
+    """
+    ARIMA(p, d, q) implemented without external dependencies.
+    Uses simple AR(p) after differencing d times.
+    MA(q) terms approximated via residual correction.
+    Suitable for stationary or trend-stationary metrics.
+    """
+
+    def __init__(
+        self,
+        granularity: str,
+        horizon: str,
+        lookback: str,
+        p: int = 3,
+        d: int = 1,
+        q: int = 1,
+    ):
+        super().__init__(granularity, horizon, lookback)
+        self.p = p
+        self.d = d
+        self.q = q
+        self._ar_coeffs: np.ndarray = None
+        self._ma_coeffs: np.ndarray = None
+        self._diff_init: list = []   # stores values needed to invert differencing
+        self._residuals: np.ndarray = None
+        self._horizon_steps = parse_duration_to_steps(horizon, granularity)
+
+    def _difference(self, y: np.ndarray, d: int):
+        diffs = [y.copy()]
+        for _ in range(d):
+            diffs.append(np.diff(diffs[-1]))
+        return diffs
+
+    def _invert_difference(self, forecast: np.ndarray, diffs: list) -> np.ndarray:
+        result = forecast.copy()
+        for orig in reversed(diffs[:-1]):
+            result = np.cumsum(np.hstack([orig[-1], result]))
+        return result
+
+    def _fit_ar(self, y: np.ndarray) -> np.ndarray:
+        n = len(y)
+        if n <= self.p:
+            return np.zeros(self.p)
+        X = np.array([y[i:n - self.p + i] for i in range(self.p)]).T
+        target = y[self.p:]
+        coeffs, _, _, _ = np.linalg.lstsq(X, target, rcond=None)
+        return coeffs
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        diffs = self._difference(y, self.d)
+        self._diff_init = diffs
+        stationary = diffs[-1]
+
+        self._ar_coeffs = self._fit_ar(stationary)
+
+        # compute residuals for MA correction
+        n = len(stationary)
+        fitted = np.array([
+            np.dot(self._ar_coeffs, stationary[i:i + self.p])
+            for i in range(n - self.p)
+        ])
+        self._residuals = stationary[self.p:] - fitted
+
+        # fit MA coefficients on residuals
+        if self.q > 0 and len(self._residuals) > self.q:
+            self._ma_coeffs = self._fit_ar(self._residuals)[:self.q]
+        else:
+            self._ma_coeffs = np.zeros(self.q)
+
+        self._is_fitted = True
+
+        mae = float(np.mean(np.abs(self._residuals)))
+        mape = float(np.mean(np.abs(self._residuals / (stationary[self.p:] + 1e-8)))) * 100
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="full_retrain",
+            extra={"p": self.p, "d": self.d, "q": self.q}
+        )
+
+    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        if not self._is_fitted:
+            return self.fit(X, y)
+        # for ARIMA finetune we do a full refit on the new window
+        # keeping p, d, q fixed
+        return self.fit(X, y)
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        if not self._is_fitted:
+            raise RuntimeError("Model is not fitted yet.")
+
+        diffs = self._diff_init
+        stationary = diffs[-1].tolist()
+        residuals = self._residuals.tolist() if self._residuals is not None else []
+
+        forecasts = []
+        for step in range(self._horizon_steps):
+            ar_input = stationary[-self.p:]
+            ar_val = np.dot(self._ar_coeffs, ar_input)
+
+            ma_val = 0.0
+            if self.q > 0 and len(residuals) >= self.q:
+                ma_val = np.dot(self._ma_coeffs, residuals[-self.q:])
+
+            val = ar_val + ma_val
+            forecasts.append(val)
+            stationary.append(val)
+            residuals.append(0.0)  # future residuals unknown, assume zero
+
+        forecast_arr = np.array(forecasts)
+        forecast_arr = self._invert_difference(forecast_arr, diffs)
+
+        timestamps = np.arange(self._horizon_steps, dtype=float)
+
+        return PredictionResult(values=forecast_arr, timestamps=timestamps)
+
+    def save(self, path: str) -> None:
+        joblib.dump({
+            "ar_coeffs": self._ar_coeffs,
+            "ma_coeffs": self._ma_coeffs,
+            "diff_init": self._diff_init,
+            "residuals": self._residuals,
+            "p": self.p,
+            "d": self.d,
+            "q": self.q,
+            "horizon_steps": self._horizon_steps,
+        }, path)
+
+    def load(self, path: str) -> None:
+        state = joblib.load(path)
+        self._ar_coeffs = state["ar_coeffs"]
+        self._ma_coeffs = state["ma_coeffs"]
+        self._diff_init = state["diff_init"]
+        self._residuals = state["residuals"]
+        self.p = state["p"]
+        self.d = state["d"]
+        self.q = state["q"]
+        self._horizon_steps = state["horizon_steps"]
+        self._is_fitted = True
 
 
 ================================================
@@ -296,19 +601,353 @@ FILE: sentinel/pipeline/models/base.py
 ================================================
 FILE: sentinel/pipeline/models/linear.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/linear.py
+
+import numpy as np
+import joblib
+from dataclasses import dataclass
+from sentinel.pipeline.models.base import BaseModel, PredictionResult, TrainingResult
+from sentinel.utils.time import parse_duration_to_steps
+
+
+class LinearTrendModel(BaseModel):
+    """
+    Simple linear regression model using least squares.
+    Best for metrics with a clear linear trend and no seasonality.
+    Fastest model in the pack, good baseline.
+    """
+
+    def __init__(self, granularity: str, horizon: str, lookback: str):
+        super().__init__(granularity, horizon, lookback)
+        self._coefficients: np.ndarray = None
+        self._intercept: float = 0.0
+        self._horizon_steps = parse_duration_to_steps(horizon, granularity)
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        X_bias = np.hstack([np.ones((X.shape[0], 1)), X])
+        coeffs, _, _, _ = np.linalg.lstsq(X_bias, y, rcond=None)
+        self._intercept = coeffs[0]
+        self._coefficients = coeffs[1:]
+        self._is_fitted = True
+
+        y_pred = X_bias @ coeffs
+        mae = float(np.mean(np.abs(y - y_pred)))
+        mape = float(np.mean(np.abs((y - y_pred) / (y + 1e-8)))) * 100
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="full_retrain"
+        )
+
+    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        if not self._is_fitted:
+            return self.fit(X, y)
+
+        # incremental least squares update using new data only
+        X_bias = np.hstack([np.ones((X.shape[0], 1)), X])
+        coeffs, _, _, _ = np.linalg.lstsq(X_bias, y, rcond=None)
+        # blend old and new coefficients 70/30
+        new_coeffs = coeffs[1:]
+        self._coefficients = 0.7 * self._coefficients + 0.3 * new_coeffs
+        self._intercept = 0.7 * self._intercept + 0.3 * coeffs[0]
+
+        y_pred = X_bias @ np.hstack([self._intercept, self._coefficients])
+        mae = float(np.mean(np.abs(y - y_pred)))
+        mape = float(np.mean(np.abs((y - y_pred) / (y + 1e-8)))) * 100
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="finetune"
+        )
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        if not self._is_fitted:
+            raise RuntimeError("Model is not fitted yet.")
+
+        values = []
+        current = X.copy()
+
+        for _ in range(self._horizon_steps):
+            val = self._intercept + current @ self._coefficients
+            values.append(float(val))
+            # roll window forward
+            current = np.roll(current, -1)
+            current[0, -1] = val
+
+        values = np.array(values)
+        timestamps = np.arange(self._horizon_steps, dtype=float)
+
+        return PredictionResult(values=values, timestamps=timestamps)
+
+    def save(self, path: str) -> None:
+        joblib.dump({
+            "coefficients": self._coefficients,
+            "intercept": self._intercept,
+            "horizon_steps": self._horizon_steps,
+        }, path)
+
+    def load(self, path: str) -> None:
+        state = joblib.load(path)
+        self._coefficients = state["coefficients"]
+        self._intercept = state["intercept"]
+        self._horizon_steps = state["horizon_steps"]
+        self._is_fitted = True
 
 
 ================================================
 FILE: sentinel/pipeline/models/sgd.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/sgd.py
+
+import numpy as np
+import joblib
+from sentinel.pipeline.models.base import BaseModel, PredictionResult, TrainingResult
+from sentinel.utils.time import parse_duration_to_steps
+
+
+class SGDRegressorModel(BaseModel):
+    """
+    Online learning model using stochastic gradient descent.
+    Best for metrics that evolve continuously and benefit from
+    incremental updates. Most finetune-friendly model in the pack.
+    Implements linear regression with SGD updates manually to
+    avoid sklearn dependency at the core.
+    """
+
+    def __init__(
+        self,
+        granularity: str,
+        horizon: str,
+        lookback: str,
+        learning_rate: float = 0.01,
+        epochs: int = 10,
+        l2: float = 1e-4,
+    ):
+        super().__init__(granularity, horizon, lookback)
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.l2 = l2
+        self._weights: np.ndarray = None
+        self._bias: float = 0.0
+        self._horizon_steps = parse_duration_to_steps(horizon, granularity)
+
+    def _init_weights(self, n_features: int):
+        self._weights = np.zeros(n_features)
+        self._bias = 0.0
+
+    def _sgd_update(self, X: np.ndarray, y: np.ndarray):
+        n = len(y)
+        for _ in range(self.epochs):
+            indices = np.random.permutation(n)
+            for i in indices:
+                xi = X[i]
+                yi = y[i]
+                pred = np.dot(self._weights, xi) + self._bias
+                error = pred - yi
+                self._weights -= self.learning_rate * (error * xi + self.l2 * self._weights)
+                self._bias -= self.learning_rate * error
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        self._init_weights(X.shape[1])
+        self._sgd_update(X, y)
+        self._is_fitted = True
+
+        y_pred = X @ self._weights + self._bias
+        mae = float(np.mean(np.abs(y - y_pred)))
+        mape = float(np.mean(np.abs((y - y_pred) / (y + 1e-8)))) * 100
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="full_retrain",
+            extra={"learning_rate": self.learning_rate, "epochs": self.epochs}
+        )
+
+    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        if not self._is_fitted:
+            return self.fit(X, y)
+
+        # continue SGD from current weights without reinitializing
+        self._sgd_update(X, y)
+
+        y_pred = X @ self._weights + self._bias
+        mae = float(np.mean(np.abs(y - y_pred)))
+        mape = float(np.mean(np.abs((y - y_pred) / (y + 1e-8)))) * 100
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="finetune"
+        )
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        if not self._is_fitted:
+            raise RuntimeError("Model is not fitted yet.")
+
+        values = []
+        current = X.copy()
+
+        for _ in range(self._horizon_steps):
+            val = float(np.dot(self._weights, current[0]) + self._bias)
+            values.append(val)
+            current = np.roll(current, -1)
+            current[0, -1] = val
+
+        values = np.array(values)
+        timestamps = np.arange(self._horizon_steps, dtype=float)
+
+        return PredictionResult(values=values, timestamps=timestamps)
+
+    def save(self, path: str) -> None:
+        joblib.dump({
+            "weights": self._weights,
+            "bias": self._bias,
+            "learning_rate": self.learning_rate,
+            "epochs": self.epochs,
+            "l2": self.l2,
+            "horizon_steps": self._horizon_steps,
+        }, path)
+
+    def load(self, path: str) -> None:
+        state = joblib.load(path)
+        self._weights = state["weights"]
+        self._bias = state["bias"]
+        self.learning_rate = state["learning_rate"]
+        self.epochs = state["epochs"]
+        self.l2 = state["l2"]
+        self._horizon_steps = state["horizon_steps"]
+        self._is_fitted = True
 
 
 ================================================
 FILE: sentinel/pipeline/models/smoothing.py
 ================================================
-[Empty file]
+# sentinel/pipeline/models/smoothing.py
+
+import numpy as np
+import joblib
+from sentinel.pipeline.models.base import BaseModel, PredictionResult, TrainingResult
+from sentinel.utils.time import parse_duration_to_steps
+
+
+class ExponentialSmoothingModel(BaseModel):
+    """
+    Double exponential smoothing (Holt's method).
+    Handles level and trend. Good for metrics with a trend
+    but no strong seasonality. Lightweight and interpretable.
+    """
+
+    def __init__(
+        self,
+        granularity: str,
+        horizon: str,
+        lookback: str,
+        alpha: float = 0.3,
+        beta: float = 0.1,
+    ):
+        super().__init__(granularity, horizon, lookback)
+        self.alpha = alpha  # level smoothing factor
+        self.beta = beta    # trend smoothing factor
+        self._level: float = 0.0
+        self._trend: float = 0.0
+        self._horizon_steps = parse_duration_to_steps(horizon, granularity)
+
+    def _holt_fit(self, y: np.ndarray):
+        level = y[0]
+        trend = y[1] - y[0]
+        for val in y[1:]:
+            prev_level = level
+            level = self.alpha * val + (1 - self.alpha) * (level + trend)
+            trend = self.beta * (level - prev_level) + (1 - self.beta) * trend
+        self._level = level
+        self._trend = trend
+
+    def _compute_fitted_values(self, y: np.ndarray) -> np.ndarray:
+        fitted = []
+        level = y[0]
+        trend = y[1] - y[0]
+        for val in y[1:]:
+            fitted.append(level + trend)
+            prev_level = level
+            level = self.alpha * val + (1 - self.alpha) * (level + trend)
+            trend = self.beta * (level - prev_level) + (1 - self.beta) * trend
+        return np.array(fitted)
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        self._holt_fit(y)
+        self._is_fitted = True
+
+        fitted = self._compute_fitted_values(y)
+        residuals = y[1:] - fitted
+        mae = float(np.mean(np.abs(residuals)))
+        mape = float(np.mean(np.abs(residuals / (y[1:] + 1e-8)))) * 100
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="full_retrain",
+            extra={"alpha": self.alpha, "beta": self.beta}
+        )
+
+    def partial_fit(self, X: np.ndarray, y: np.ndarray) -> TrainingResult:
+        if not self._is_fitted:
+            return self.fit(X, y)
+
+        # update level and trend on recent data only
+        for val in y:
+            prev_level = self._level
+            self._level = self.alpha * val + (1 - self.alpha) * (self._level + self._trend)
+            self._trend = self.beta * (self._level - prev_level) + (1 - self.beta) * self._trend
+
+        fitted = self._compute_fitted_values(y)
+        residuals = y[1:] - fitted if len(y) > 1 else np.array([0.0])
+        mae = float(np.mean(np.abs(residuals)))
+        mape = float(np.mean(np.abs(residuals / (y[1:] + 1e-8)))) * 100 if len(y) > 1 else 0.0
+
+        return TrainingResult(
+            mae=mae,
+            mape=mape,
+            n_samples=len(y),
+            training_policy="finetune"
+        )
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        if not self._is_fitted:
+            raise RuntimeError("Model is not fitted yet.")
+
+        values = []
+        for step in range(1, self._horizon_steps + 1):
+            values.append(self._level + step * self._trend)
+
+        values = np.array(values)
+        timestamps = np.arange(self._horizon_steps, dtype=float)
+
+        return PredictionResult(values=values, timestamps=timestamps)
+
+    def save(self, path: str) -> None:
+        joblib.dump({
+            "level": self._level,
+            "trend": self._trend,
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "horizon_steps": self._horizon_steps,
+        }, path)
+
+    def load(self, path: str) -> None:
+        state = joblib.load(path)
+        self._level = state["level"]
+        self._trend = state["trend"]
+        self.alpha = state["alpha"]
+        self.beta = state["beta"]
+        self._horizon_steps = state["horizon_steps"]
+        self._is_fitted = True
 
 
 ================================================
